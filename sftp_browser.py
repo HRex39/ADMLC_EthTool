@@ -116,8 +116,27 @@ class SFTPBrowser(tk.Toplevel):
         if local_parent:
             local_dir = os.path.join(local_parent, foldername)
             remote_path = self._join_path(self.current_path, foldername)
+
+            # 计算总文件数
+            total_files = self._count_files(remote_path)
+            self.progress_win = tk.Toplevel(self)
+            self.progress_win.title("下载进度")
+            self.progress = ttk.Progressbar(self.progress_win, length=300, mode="determinate", maximum=total_files)
+            self.progress.pack(padx=20, pady=20)
+
             self._download_dir(remote_path, local_dir)
+            self.progress_win.destroy()
             messagebox.showinfo("完成", f"已下载文件夹 {foldername}")
+
+    def _count_files(self, remote_dir):
+        count = 0
+        for entry in self.sftp.listdir_attr(remote_dir):
+            remote_path = self._join_path(remote_dir, entry.filename)
+            if self._is_dir(entry, remote_path):
+                count += self._count_files(remote_path)
+            else:
+                count += 1
+        return count
 
     def _download_dir(self, remote_dir, local_dir):
         os.makedirs(local_dir, exist_ok=True)
@@ -128,6 +147,9 @@ class SFTPBrowser(tk.Toplevel):
                 self._download_dir(remote_path, local_path)
             else:
                 self.sftp.get(remote_path, local_path)
+                # 更新进度条
+                self.progress.step(1)
+                self.progress.update()
 
     def upload_file(self):
         filepath = filedialog.askopenfilename()
