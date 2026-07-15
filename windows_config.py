@@ -317,7 +317,7 @@ def apply_config_windows(iface, cfg, output_text):
         output_text.see("end")
         output_text.update_idletasks()
 
-        output_text.insert("end", f"[5/5]✅ 已完成默认配置 {iface}\n")
+        output_text.insert("end", f"[5/5]✅ 已完成{iface} Default配置 \n✅ 可以连接DDT和DPS\n")
         output_text.see("end")
         output_text.update_idletasks()
         return
@@ -390,6 +390,6 @@ def apply_config_windows(iface, cfg, output_text):
             mac_entry = entry.get("mac")
             add_static_arp(ip, mac_entry, output_text)
 
-    output_text.insert("end", f"[4/4]✅ 已完成{iface}测试配置\n")
+    output_text.insert("end", f"[4/4]✅ 已完成{iface}Test 配置\n✅ 可以尝试连接172.16.105.26\n")
     output_text.see("end")
     output_text.update_idletasks()

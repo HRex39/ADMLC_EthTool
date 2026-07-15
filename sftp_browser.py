@@ -572,7 +572,7 @@ class SFTPBrowser(tk.Toplevel):
         使用统一进度窗口显示总进度与当前文件名（后台线程执行）。
         """
         # 远程目标列表（按需可改）
-        targets = ["/log", "/backlog", "/alglog"]
+        targets = ["/log", "/backlog", "/alglog", "/f120calib", "/params"]
 
         # 让用户选择本地父目录
         local_parent = filedialog.askdirectory(title="选择保存售后数据的本地目录")
