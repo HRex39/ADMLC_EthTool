@@ -1,0 +1,22 @@
+{
+  "Auto": {
+    "mode": "default",
+    "ip": "auto",
+    "netmask": "auto",
+    "gateway": "auto",
+    "vlan_id": "auto",
+    "mac": "auto",
+    "arp": "auto"
+  },
+  "ADMLC_DebugTool": {
+    "mode": "test",
+    "ip": "172.16.105.105",
+    "netmask": "255.255.255.0",
+    "gateway": "auto",
+    "vlan_id": 105,
+    "mac": "0A0B0C026969",
+    "arp": [
+      {"ip": "172.16.105.26", "mac": "0A-0B-0C-02-00-06"}
+    ]
+  }
+}

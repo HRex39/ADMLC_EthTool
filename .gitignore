@@ -1,0 +1,25 @@
+# Python 缓存和编译文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# 打包/构建产物
+build/
+dist/
+*.spec
+
+# 编辑器/系统文件
+.DS_Store
+Thumbs.db
+
+# 配置文件（避免上传真实内网配置）
+# configs.json
+
+# 日志文件
+*.log
