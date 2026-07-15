@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk
 import psutil, json, platform, os, sys
 import threading
+from sftp_browser import SFTPBrowser
 
 def run_as_admin():
     if platform.system().lower() == "windows":
@@ -77,6 +78,9 @@ def on_config_select(event):
         # 在后台线程里执行，避免阻塞 Tkinter 主线程
         threading.Thread(target=lambda: apply_config(iface, cfg, output_text)).start()
 
+def open_sftp_window():
+    SFTPBrowser(root, host="172.16.105.26", user="root", password="bY6dCcBBZ0HsM3m")
+
 run_as_admin()
 check_admin()
 
@@ -96,6 +100,8 @@ config_combo = ttk.Combobox(root, textvariable=config_var, values=list(configs.k
 config_combo.pack(pady=5)
 config_combo.bind("<<ComboboxSelected>>", on_config_select)
 # config_combo.current(0)
+
+ttk.Button(root, text="打开 SFTP 浏览器", command=open_sftp_window).pack(pady=5)
 
 output_text = tk.Text(root, height=15, width=60)
 output_text.pack(pady=10)
