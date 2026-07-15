@@ -119,12 +119,19 @@ class SFTPBrowser(tk.Toplevel):
 
             # 计算总文件数
             total_files = self._count_files(remote_path)
+
+            # 创建进度窗口
             self.progress_win = tk.Toplevel(self)
             self.progress_win.title("下载进度")
             self.progress = ttk.Progressbar(self.progress_win, length=300, mode="determinate", maximum=total_files)
-            self.progress.pack(padx=20, pady=20)
+            self.progress.pack(padx=20, pady=10)
+            self.progress_label = tk.Label(self.progress_win, text="准备下载...")
+            self.progress_label.pack(padx=20, pady=5)
 
+            # 开始下载
             self._download_dir(remote_path, local_dir)
+
+            # 下载完成
             self.progress_win.destroy()
             messagebox.showinfo("完成", f"已下载文件夹 {foldername}")
 
@@ -147,8 +154,9 @@ class SFTPBrowser(tk.Toplevel):
                 self._download_dir(remote_path, local_path)
             else:
                 self.sftp.get(remote_path, local_path)
-                # 更新进度条
+                # 更新进度条和标签
                 self.progress.step(1)
+                self.progress_label.config(text=f"正在下载: {entry.filename} ({int(self.progress['value'])}/{int(self.progress['maximum'])})")
                 self.progress.update()
 
     def upload_file(self):
