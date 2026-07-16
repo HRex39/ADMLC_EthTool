@@ -15,6 +15,10 @@ import subprocess
 import re
 import time
 
+global NETWORK_ADDRESSES, VLANID_PROPERTIES
+NETWORK_ADDRESSES = ["Network Address", "网络地址", "NetworkAddress", "网络 地址"]
+VLANID_PROPERTIES = ["VLAN ID", "VLAN标识"]
+
 # -------------------- 基础工具函数 --------------------
 
 def run(cmd):
@@ -94,14 +98,23 @@ def safe_set_property(iface, display_name, display_value, output_text):
         val_expr = f"'{v}'"
     dn = display_name.replace("'", "''")
     cmd = f"Set-NetAdapterAdvancedProperty -Name '{iface}' -DisplayName '{dn}' -DisplayValue {val_expr}"
-    rc, out, err = pw(cmd)
+    try:
+        rc, out, err = pw(cmd)
+    except Exception as e:
+        output_text.insert("end", f"⚠️ 设置 {display_name} 时发生异常: {e}\n")
+        output_text.see("end")
+        output_text.update_idletasks()
+        return False
     if rc == 0:
-        output_text.insert("end", f"ℹ️ 已设置 {display_name} = {display_value}\n")
+        output_text.insert("end", f"ℹ️ 设置 {display_name} 成功\n")
+        output_text.see("end")
         output_text.update_idletasks()
         return True
     else:
         msg = err or out or "未知错误"
-        output_text.insert("end", f"⚠️ 设置 {display_name} 失败: {msg}\n")
+        display_msg = "此 -DisplayName 不匹配 "
+        output_text.insert("end", f"⚠️ 设置 {display_name} 失败: {display_msg}\n")
+        output_text.see("end")
         output_text.update_idletasks()
         return False
 
@@ -303,14 +316,32 @@ def apply_config_windows(iface, cfg, output_text):
         output_text.update_idletasks()
 
         # 2) VLAN → 默认禁用
-        safe_set_property(iface, "Packet Priority & VLAN", "Packet Priority & VLAN Disable", output_text)
+        for vlan_name in ["Packet Priority & VLAN", "数据包优先级和 VLAN"]:
+            if safe_set_property(iface, vlan_name, vlan_name + " Disable", output_text):
+                output_text.insert("end", f"[2/5] 已禁用 VLAN 属性 ({vlan_name})\n")
+                output_text.see("end")
+                output_text.update_idletasks()
+                break
+        for vlan_id in VLANID_PROPERTIES:
+            if safe_set_property(iface, vlan_id, '0', output_text):
+                output_text.insert("end", f"[2/5] 已恢复默认 VLAN ID (属性名:{vlan_id})\n")
+                output_text.see("end")
+                output_text.update_idletasks()
+                break
 
         # 3) MAC → 恢复硬件默认（清空 Network Address）
-        pw(f"Set-NetAdapterAdvancedProperty -Name '{iface}' -DisplayName '网络地址' -DisplayValue '--'")
-        output_text.insert("end", "[3/5] 已恢复默认 MAC（硬件地址）\n")
-        output_text.see("end")
-        output_text.update_idletasks()
-
+        for mac_name in NETWORK_ADDRESSES:
+            if safe_set_property(iface, mac_name, "--", output_text):
+                output_text.insert("end", f"[3/5] 已恢复默认 网络地址(属性名: {mac_name})\n")
+                output_text.see("end")
+                output_text.update_idletasks()  
+                break
+            # if pw(f"Set-NetAdapterAdvancedProperty -Name '{iface}' -DisplayName '{mac_name}' -DisplayValue '--'"):
+            #     output_text.insert("end", f"[3/5] 已恢复默认 MAC（属性名: {mac_name}）\n")
+            #     output_text.see("end")
+            #     output_text.update_idletasks()  
+            #     break
+        
         # 4) ARP → 清空
         run(["arp", "-d", "*"])
         output_text.insert("end", "[4/5] 已清空 ARP 表\n")
@@ -346,10 +377,12 @@ def apply_config_windows(iface, cfg, output_text):
     if vlan_enabled and cfg.get("vlan_id", "auto") != "auto":
         try:
             vid = int(cfg["vlan_id"])
-            if safe_set_property(iface, "VLAN标识", vid, output_text):
-                output_text.insert("end", f"[2/4] VLAN ID 已设置为 {vid}\n[Setting Network...]\n")
-                output_text.see("end")
-                output_text.update_idletasks()
+            for vlan_prop in VLANID_PROPERTIES:
+                if safe_set_property(iface, vlan_prop, vid, output_text):
+                    output_text.insert("end", f"[2/4] VLAN ID 已设置为 {vid} (属性名: {vlan_prop})\n[Setting Network...]\n")
+                    output_text.see("end")
+                    output_text.update_idletasks()
+                    break
             else:
                 output_text.insert("end", "⚠️ 设置 VLAN ID 失败，请检查驱动或手动设置\n")
                 output_text.see("end")
@@ -364,22 +397,18 @@ def apply_config_windows(iface, cfg, output_text):
     if mac != "auto" and mac:
         norm = ''.join(ch for ch in mac if ch.isalnum()).lower()
         if len(norm) == 12 and all(c in "0123456789abcdef" for c in norm):
-            mac_props = find_property(iface, "Network Address|网络地址|NetworkAddress|网络 地址")
-            if mac_props:
-                if not safe_set_property(iface, mac_props[0], norm, output_text):
-                    output_text.insert("end", "⚠️ 写入 MAC 属性失败，可能驱动不支持通过高级属性修改 MAC\n")
+            for mac_prop in NETWORK_ADDRESSES:
+                if safe_set_property(iface, mac_prop, norm, output_text):
+                    output_text.insert("end", f"[3/4] 写入 MAC 后已重启网卡以生效 (属性名: {mac_prop})\n")
                     output_text.see("end")
                     output_text.update_idletasks()
-                else:
-                    output_text.insert("end", "[3/4] 写入 MAC 后已重启网卡以生效\n")
-                    output_text.see("end")
-                    output_text.update_idletasks()
+                    break
             else:
                 output_text.insert("end", "⚠️ 未找到可写的 NetworkAddress 属性，跳过 MAC 设置\n")
                 output_text.see("end")
                 output_text.update_idletasks()
         else:
-            output_text.insert("end", "⚠️ 提供的 MAC 格式不正确，需为 12 位十六进制（可带分隔符），例如 02:11:22:33:44:55\n")
+            output_text.insert("end", "⚠️ 提供的 MAC 格式不正确，需为 12 位十六进制，例如 02:11:22:33:44:55\n")
             output_text.see("end")
             output_text.update_idletasks()
 
