@@ -230,7 +230,7 @@ def show_about():
     """
     about_text = (
         "网口配置工具 & 售后数据下载器\n"
-        "版本: 1.5\n"
+        "版本: 1.7\n"
         "作者: Chenrui Huang\n"
         "邮箱: hcr2077@outlook.com\n\n"
         "说明: 本工具用于网口配置与远程设备售后数据下载。"
@@ -266,7 +266,7 @@ except Exception:
 # 在主窗口底部添加一行作者信息（可选）
 author_frame = ttk.Frame(root)
 author_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=6, pady=(0,6))
-author_label = ttk.Label(author_frame, text="作者: Chenrui Huang    版本: 1.5", anchor="w")
+author_label = ttk.Label(author_frame, text="作者: Chenrui Huang    版本: 1.7", anchor="w")
 author_label.pack(side=tk.LEFT)
 
 iface_var = tk.StringVar()

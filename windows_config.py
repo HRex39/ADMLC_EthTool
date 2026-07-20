@@ -102,19 +102,19 @@ def safe_set_property(iface, display_name, display_value, output_text):
     try:
         rc, out, err = pw(cmd)
     except Exception as e:
-        output_text.insert("end", f"⚠️ 设置 {display_name} 时发生异常: {e}\n")
+        output_text.insert("end", f"⚠️ 设置 {display_name}: {display_value} 时发生异常: {e}\n")
         output_text.see("end")
         output_text.update_idletasks()
         return False
     if rc == 0:
-        output_text.insert("end", f"ℹ️ 设置 {display_name} 成功\n")
+        output_text.insert("end", f"ℹ️ 设置 {display_name}: {display_value} 成功: 此 -DisplayName 匹配\n")
         output_text.see("end")
         output_text.update_idletasks()
         return True
     else:
         msg = err or out or "未知错误"
         display_msg = "此 -DisplayName 不匹配 "
-        output_text.insert("end", f"⚠️ 设置 {display_name} 失败: {display_msg}\n")
+        output_text.insert("end", f"⚠️ 设置 {display_name}: {display_value} 失败: {display_msg}\n")
         output_text.see("end")
         output_text.update_idletasks()
         return False
@@ -183,40 +183,44 @@ def enable_vlan_if_possible(iface, output_text):
 
 # -------------------- ARP 处理 --------------------
 
-def add_static_arp(ip, mac_raw, output_text):
+def get_iface_index(iface_name):
     """
-    在 Windows 上添加静态 ARP：把 mac_raw 规范化为连字符格式并调用 arp -s。
-    返回 True/False 并在 output_text 中写入详细信息。
+    根据接口名称自动获取索引号
     """
-    if not ip or not mac_raw:
-        output_text.insert("end", f"⚠️ ARP 条目不完整，跳过: ip={ip}, mac={mac_raw}\n")
-        output_text.update_idletasks()
-        return False
+    try:
+        result = subprocess.run(
+            ["netsh", "interface", "ipv4", "show", "interfaces"],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True
+        )
+        for line in result.stdout.splitlines():
+            m = re.match(r"^\s*(\d+)\s+\S+\s+\S+\s+\S+\s+(.+)$", line)
+            if m:
+                idx, name = m.groups()
+                if name.strip().lower() == iface_name.strip().lower():
+                    return str(idx)
+    except Exception as e:
+        print(f"获取接口索引失败: {e}")
+    return None
 
-    # 规范化 MAC：把冒号/点换成连字符，去掉空白，转大写
-    mac = mac_raw.replace(":", "-").replace(".", "-").replace(" ", "").upper()
-    # 如果用户给的是连续12位十六进制，插入连字符
-    compact = re.sub(r'[^0-9A-Fa-f]', '', mac_raw)
-    if re.fullmatch(r"[0-9A-Fa-f]{12}", compact):
-        s = compact.upper()
-        mac = "-".join([s[i:i+2] for i in range(0, 12, 2)])
+def add_static_arp(ip, mac, output_text, iface_name="以太网 13"):
+    try:
+        idx = get_iface_index(iface_name)  # 自动查索引号
+        if not idx:
+            output_text.insert("end", f"⚠️ 未找到接口 {iface_name}\n")
+            return
+        mac_win = mac.replace(":", "-").replace(".", "-")
+        # 先尝试删除旧条目
+        subprocess.run(
+            ["netsh", "interface", "ipv4", "delete", "neighbors", str(idx), ip],
+            capture_output=True, text=True
+        )
+        cmd = ["netsh", "interface", "ipv4", "add", "neighbors", str(idx), ip, mac_win]
+        output_text.insert("end",f"执行命令: {' '.join(cmd)}\n")
+        subprocess.run(cmd, check=True)
+        output_text.insert("end", f"✅ 已添加静态 ARP: {iface_name} (索引 {idx}) {ip} -> {mac_win}\n")
+    except Exception as e:
+        output_text.insert("end", f"⚠️ 添加 ARP 失败: {e}\n")
 
-    # 校验最终格式
-    if not re.fullmatch(r"([0-9A-F]{2}-){5}[0-9A-F]{2}", mac):
-        output_text.insert("end", f"⚠️ ARP MAC 格式不合法: {mac_raw} -> {mac}\n")
-        output_text.update_idletasks()
-        return False
-
-    # 执行 arp -s
-    rc, out, err = run(["arp", "-s", ip, mac])
-    if rc == 0:
-        output_text.insert("end", f"ℹ️ ARP 已添加 {ip} -> {mac}\n")
-        output_text.update_idletasks()
-        return True
-    else:
-        output_text.insert("end", f"⚠️ 添加 ARP {ip} -> {mac} 失败: {err or out}\n")
-        output_text.update_idletasks()
-        return False
 
 def clear_arp_table(output_text):
     """
@@ -317,12 +321,17 @@ def apply_config_windows(iface, cfg, output_text):
         output_text.update_idletasks()
 
         # 2) VLAN → 默认禁用
+        vlan_name_map_flag = False
         for vlan_name in PACKET_PRIORITY_PROPERTIES:
-            if safe_set_property(iface, vlan_name, vlan_name + " Disable", output_text):
-                output_text.insert("end", f"[2/5] 已禁用 VLAN 属性 ({vlan_name})\n")
-                output_text.see("end")
-                output_text.update_idletasks()
+            if vlan_name_map_flag:
                 break
+            for vlan_prop in PACKET_PRIORITY_PROPERTIES:
+                if safe_set_property(iface, vlan_name, vlan_prop + " Disable", output_text):
+                    output_text.insert("end", f"[2/5] 已禁用 VLAN 属性 ({vlan_name})\n")
+                    output_text.see("end")
+                    output_text.update_idletasks()
+                    vlan_name_map_flag = True
+                    break
         for vlan_id in VLANID_PROPERTIES:
             if safe_set_property(iface, vlan_id, '0', output_text):
                 output_text.insert("end", f"[2/5] 已恢复默认 VLAN ID (属性名:{vlan_id})\n")
@@ -418,7 +427,7 @@ def apply_config_windows(iface, cfg, output_text):
         for entry in cfg["arp"]:
             ip = entry.get("ip")
             mac_entry = entry.get("mac")
-            add_static_arp(ip, mac_entry, output_text)
+            add_static_arp(ip, mac_entry, output_text, iface)
 
     output_text.insert("end", f"[4/4]✅ 已完成{iface}Test 配置\n✅ 可以尝试连接172.16.105.26\n")
     output_text.see("end")
