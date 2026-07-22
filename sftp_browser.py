@@ -34,6 +34,7 @@ class SFTPBrowser(tk.Toplevel):
         btn_frame = tk.Frame(self)
         btn_frame.pack(fill=tk.X, pady=5)
         ttk.Button(btn_frame, text="一键下载售后问题数据", command=self.download_aftersales).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="一键下载标定数据", command=self.download_calib).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="下载文件", command=self.download_file).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="下载文件夹", command=self.download_folder).pack(side=tk.LEFT, padx=5)
         # ttk.Button(btn_frame, text="上传文件", command=self.upload_file).pack(side=tk.LEFT, padx=5)
@@ -80,47 +81,41 @@ class SFTPBrowser(tk.Toplevel):
         """在主线程执行 UI 更新"""
         self.after(0, lambda: fn(*a, **kw))
 
-    def _is_dir(self, entry, remote_path=None):
+    def _is_dir(sftp, entry=None, remote_path=None):
         """
-        健壮判断远程 entry 是否为目录。
-        - entry: paramiko.SFTPAttributes（可能包含 st_mode）
-        - remote_path: 该 entry 的完整远程路径（例如 "/log"）
-        返回 True 表示目录（包括指向目录的软链接），否则 False。
+        健壮判断远程路径是否为目录。
+        - sftp: paramiko.SFTPClient 实例
+        - entry: paramiko.SFTPAttributes，可选
+        - remote_path: 完整远程路径
+        返回 True 表示目录（包括软链接指向目录），否则 False。
         """
         try:
-            mode = getattr(entry, "st_mode", None)
-            if mode is not None and mode != 0:
-                # 普通目录
+            mode = getattr(entry, "st_mode", None) if entry else None
+            if mode and mode != 0:
                 if stat.S_ISDIR(mode):
                     return True
-                # 如果是软链接，跟随目标判断
                 if stat.S_ISLNK(mode) and remote_path:
                     try:
-                        target_attr = self.sftp.stat(remote_path)  # 跟随链接
+                        target_attr = sftp.stat(remote_path)
                         return stat.S_ISDIR(target_attr.st_mode)
                     except Exception:
                         return False
-                return False
+                # 明确排除常见非目录类型
+                if stat.S_ISREG(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode) \
+                or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
+                    return False
         except Exception:
-            # 如果 entry.st_mode 读取出错，继续走兜底逻辑
             pass
 
-        # 兜底：用 lstat/stat 判断（当 entry.st_mode 不可靠时）
+        # 兜底：只有在 st_mode 不可靠时才尝试 chdir
         if remote_path:
             try:
-                attr = self.sftp.lstat(remote_path)
-                if stat.S_ISDIR(attr.st_mode):
-                    return True
-                if stat.S_ISLNK(attr.st_mode):
-                    try:
-                        target_attr = self.sftp.stat(remote_path)
-                        return stat.S_ISDIR(target_attr.st_mode)
-                    except Exception:
-                        return False
+                sftp.chdir(remote_path)
+                sftp.chdir("..")
+                return True
             except Exception:
-                # lstat/stat 失败（权限/网络等），保守返回 False
                 return False
-        return False
+        return False    
 
 
     # ---------------- 树状加载 ----------------
@@ -302,8 +297,8 @@ class SFTPBrowser(tk.Toplevel):
         # 确认是目录
         try:
             attr = self.sftp.lstat(remote_path)
-            if not stat.S_ISDIR(attr.st_mode):
-                messagebox.showinfo("提示", f"{remote_path} 不是目录")
+            if not stat.S_ISDIR(attr.st_mode) and not stat.S_ISLNK(attr.st_mode):
+                messagebox.showinfo("提示", f"{remote_path} 不是目录或软链接，无法下载文件夹")
                 return
         except Exception:
             messagebox.showinfo("提示", f"无法判断是否为目录")
@@ -321,13 +316,17 @@ class SFTPBrowser(tk.Toplevel):
         threading.Thread(target=self._download_worker, args=(remote_path, local_dir, total_files), daemon=True).start()
 
     def _download_worker(self, remote_path, local_dir, total_files):
+        errors = []
         try:
-            self._safe_ui(self._start_progress, total_files, f"下载: {os.path.basename(remote_path)}")
-            self._download_dir(remote_path, local_dir)
+            self._safe_ui(self._start_progress, total_files, f"下载 {remote_path}")
+            self._download_dir(remote_path, local_dir, errors)
+        finally:
             self._safe_ui(self._end_progress)
-            self._safe_ui(messagebox.showinfo, "完成", f"已下载文件夹 {os.path.basename(remote_path)}")
-        except Exception as e:
-            self._safe_ui(messagebox.showerror, "错误", f"下载失败: {e}\n{traceback.format_exc()}")
+            if errors:
+                msg = "\n".join([f"{p}: {err}" for p, err in errors])
+                self._safe_ui(messagebox.showerror, "部分文件下载失败", msg)
+            else:
+                self._safe_ui(messagebox.showinfo, "完成", f"已下载 {remote_path}")
 
     def _count_files(self, remote_dir):
         count = 0
@@ -342,17 +341,37 @@ class SFTPBrowser(tk.Toplevel):
             pass
         return count
 
-    def _download_dir(self, remote_dir, local_dir):
+    def _download_dir(self, remote_dir, local_dir, errors=None):
         os.makedirs(local_dir, exist_ok=True)
         for entry in self.sftp.listdir_attr(remote_dir):
             remote_path = self._join_path(remote_dir, entry.filename)
             local_path = os.path.join(local_dir, entry.filename)
-            if self._is_dir(entry, remote_path):
-                self._download_dir(remote_path, local_path)
-            else:
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                self.sftp.get(remote_path, local_path)
-                self._safe_ui(self._step_progress, entry.filename)
+            try:
+                if stat.S_ISDIR(entry.st_mode):
+                    self._download_dir(remote_path, local_path, errors)
+                elif stat.S_ISLNK(entry.st_mode):
+                    # 软链接，跟随目标
+                    try:
+                        target_attr = self.sftp.stat(remote_path)
+                        if stat.S_ISDIR(target_attr.st_mode):
+                            self._download_dir(remote_path, local_path, errors)
+                        else:
+                            self.sftp.get(remote_path, local_path)
+                    except Exception as e:
+                        if errors is not None:
+                            errors.append((remote_path, f"软链接下载失败: {e}"))
+                else:
+                    try:
+                        self.sftp.get(remote_path, local_path)
+                    except Exception as e:
+                        if errors is not None:
+                            errors.append((remote_path, str(e)))
+                # 每个文件完成后更新进度
+                self._safe_ui(self._step_progress, remote_path)
+            except Exception as e:
+                if errors is not None:
+                    errors.append((remote_path, str(e)))
+
 
     # ---------------- 上传 ----------------
     def upload_file(self):
@@ -572,10 +591,26 @@ class SFTPBrowser(tk.Toplevel):
         使用统一进度窗口显示总进度与当前文件名（后台线程执行）。
         """
         # 远程目标列表（按需可改）
-        targets = ["/log", "/backlog", "/alglog", "/f120calib", "/params"]
+        targets = ["/log", "/backlog", "/alglog"]
 
         # 让用户选择本地父目录
         local_parent = filedialog.askdirectory(title="选择保存售后数据的本地目录")
+        if not local_parent:
+            return
+
+        # 计算总文件数（可能耗时，放到线程里）
+        threading.Thread(target=self._download_aftersales_worker, args=(targets, local_parent), daemon=True).start()
+    
+    def download_calib(self):
+        """
+        一键下载 /f120calib, /params 两个远程文件夹到本地选择的父目录。
+        使用统一进度窗口显示总进度与当前文件名（后台线程执行）。
+        """
+        # 远程目标列表（按需可改）
+        targets = ["/f120calib", "/params"]
+
+        # 让用户选择本地父目录
+        local_parent = filedialog.askdirectory(title="选择保存标定数据的本地目录")
         if not local_parent:
             return
 
