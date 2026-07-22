@@ -18,7 +18,7 @@ import time
 global NETWORK_ADDRESSES, VLANID_PROPERTIES, PACKET_PRIORITY_PROPERTIES
 NETWORK_ADDRESSES = ["Network Address", "网络地址", "NetworkAddress", "网络 地址"]
 VLANID_PROPERTIES = ["VLAN ID", "VLAN标识"]
-PACKET_PRIORITY_PROPERTIES = ["Packet Priority & VLAN", "数据包优先级 & VLAN", "优先级 & VLAN", "Priority & VLAN"]
+PACKET_PRIORITY_PROPERTIES = ["Packet Priority & VLAN", "数据包优先级 & VLAN", "优先级 & VLAN", "Priority & VLAN", "数据包优先级和 VLAN", "优先级和 VLAN"]
 
 # -------------------- 基础工具函数 --------------------
 
