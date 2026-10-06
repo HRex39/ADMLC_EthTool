@@ -20,12 +20,14 @@ import time
 import nic_driver
 from nic_driver import (
     ROLE_LABEL,
+    SOURCE_LABEL,
     AdapterInspector,
     apply_property_ops,
     as_log,
     choose_vlan_mode_value,
     mac_warning,
     normalize_mac,
+    try_roles,
 )
 from nic_driver import restart_adapter as _restart_adapter_ps
 
@@ -208,25 +210,24 @@ def restart_adapter(iface, log_target=None, wait_seconds=25):
 # 内部：日志与结果汇总
 # ----------------------------------------------------------------------------
 
-def _report_ops(results, log):
-    """把批量写入结果写进日志，返回是否有任意一项成功。"""
-    if not results:
-        return False
-    any_ok = False
-    for item in results:
-        role = item.get("role")
-        label = ROLE_LABEL.get(role, role or "?")
-        keyword = item.get("kw")
-        if item.get("ok"):
-            any_ok = True
-            log("   ✅ %s (%s) 写入成功" % (label, keyword))
-        else:
-            log("   ⚠️ %s (%s) 写入失败: %s" % (label, keyword, item.get("msg")))
-    return any_ok
+def _persist_learned(inspector, results, iface, log):
+    """
+    把本次写入且回读校验通过的关键字记入本地档案 driver_profiles.local.json。
+    用户全程零操作：插过的网卡下次直接命中，不必手工编辑任何 JSON。
+    """
+    learned = {role: info.get("keyword") for role, info in (results or {}).items()
+               if info.get("ok") and info.get("keyword")}
+    if not learned or not inspector.ok:
+        return
+    changed = nic_driver.persist_profile(inspector.description or iface, learned,
+                                         interface=iface)
+    if changed:
+        log("   ℹ️ 已把本网卡识别结果记入 driver_profiles.local.json"
+            "（下次插同一张网卡自动命中，无需手工维护）")
 
 
 def _probe(iface, log):
-    """探测驱动属性并打印识别结果，返回 AdapterInspector。"""
+    """探测驱动属性并打印识别结果（含来源），返回 AdapterInspector。"""
     start = time.time()
     log("[探测] 正在读取网卡驱动高级属性……")
     inspector = AdapterInspector(iface)
@@ -235,14 +236,16 @@ def _probe(iface, log):
         log("[探测] 将跳过 MAC/VLAN 高级属性设置（IP 与 ARP 仍会执行）")
         return inspector
     log("[探测] 驱动型号: %s" % (inspector.description or "未知"))
-    log("[探测] 匹配档案: %s" % (inspector.profile_name or "（无，使用内置关键字表）"))
+    log("[探测] 匹配档案: %s" % (inspector.profile_name or "（无，使用内置关键字表/语义推断）"))
     for role in ("mac", "vlan_mode", "vlan_id"):
         keyword = inspector.role_keyword(role)
+        source = SOURCE_LABEL.get(inspector.role_source(role), inspector.role_source(role))
         if keyword:
-            log("[探测] %s -> %s ｜ 显示名: %s ｜ 当前值: %s" % (
-                ROLE_LABEL[role], keyword, inspector.role_display(role), inspector.current_value(role)))
+            log("[探测] %s → %s ｜ 来源: %s ｜ 显示名: %s ｜ 当前值: %s" % (
+                ROLE_LABEL[role], keyword, source,
+                inspector.role_display(role), inspector.current_value(role)))
         else:
-            log("[探测] %s -> 该驱动未提供此属性" % ROLE_LABEL[role])
+            log("[探测] %s → 该驱动未提供此属性（%s）" % (ROLE_LABEL[role], source))
     log("[探测] 耗时 %.2fs" % (time.time() - start))
     return inspector
 
@@ -291,31 +294,21 @@ def apply_config_windows(iface, cfg, log_target):
             log("   ⚠️ 切换 DNS 为自动失败: %s" % (err or out))
 
         log("[2/5] 恢复 MAC / VLAN 驱动属性为默认……")
-        ops = []
+        requests = []
         if inspector.ok:
-            if inspector.mac_prop:
-                ops.append({"role": "mac",
-                            "kw": inspector.role_keyword("mac"),
-                            "mode": "reset"})
-            if inspector.vlan_mode_prop:
-                value, text = choose_vlan_mode_value(inspector.vlan_mode_prop, enable=False)
-                if value is None:
-                    ops.append({"role": "vlan_mode",
-                                "kw": inspector.role_keyword("vlan_mode"),
-                                "mode": "reset"})
-                else:
-                    ops.append({"role": "vlan_mode",
-                                "kw": inspector.role_keyword("vlan_mode"),
-                                "mode": "set", "val": value})
-                    log("   将 VLAN 开关设为: %s" % text)
-            if inspector.vlan_id_prop:
-                ops.append({"role": "vlan_id",
-                            "kw": inspector.role_keyword("vlan_id"),
-                            "mode": "set", "val": 0})
-        if ops:
-            needs_restart = _report_ops(apply_property_ops(iface, ops), log)
+            if inspector.role_candidates("mac"):
+                requests.append({"role": "mac", "kind": "reset"})
+            if inspector.role_candidates("vlan_mode"):
+                requests.append({"role": "vlan_mode", "kind": "disable",
+                                 "fallback_reset": True})
+            if inspector.role_candidates("vlan_id"):
+                requests.append({"role": "vlan_id", "kind": "set", "value": 0})
+        if requests:
+            results = try_roles(iface, inspector, requests, log)
+            needs_restart = any(item.get("ok") for item in results.values())
+            _persist_learned(inspector, results, iface, log)
         else:
-            log("   ℹ️ 无需恢复的高级属性（未识别到 MAC/VLAN 属性）")
+            log("   ℹ️ 未识别到 MAC/VLAN 属性，跳过恢复")
 
         log("[3/5] 清空 ARP 表……")
         clear_arp_table(log)
@@ -331,7 +324,7 @@ def apply_config_windows(iface, cfg, log_target):
         return
 
     # ======================= TEST：按配置应用 =======================
-    ops = []
+    requests = []
     expected = []
 
     # ---- MAC ----
@@ -340,14 +333,13 @@ def apply_config_windows(iface, cfg, log_target):
         mac_norm = normalize_mac(mac_cfg)
         if mac_norm is None:
             log("⚠️ MAC 格式不正确（需 12 位十六进制，如 0A0B0C026969），已跳过")
-        elif not inspector.ok or not inspector.mac_prop:
+        elif not inspector.ok or not inspector.role_candidates("mac"):
             log("⚠️ 未找到可写的网络地址(MAC)属性，已跳过 MAC 设置")
         else:
             warn = mac_warning(mac_norm)
             if warn:
                 log("ℹ️ MAC 提示: %s" % warn)
-            ops.append({"role": "mac", "kw": inspector.role_keyword("mac"),
-                        "mode": "set", "val": mac_norm})
+            requests.append({"role": "mac", "kind": "set", "value": mac_norm})
             expected.append("MAC=%s" % mac_norm)
 
     # ---- VLAN ----
@@ -360,30 +352,24 @@ def apply_config_windows(iface, cfg, log_target):
             want_vlan = False
 
     if want_vlan:
-        mode_ok = False
-        if not inspector.ok or not inspector.vlan_mode_prop:
-            log("⚠️ 该驱动没有 VLAN 开关属性，无法启用 VLAN 标签")
+        if not inspector.ok or not inspector.role_candidates("vlan_mode"):
+            log("⚠️ 该驱动没有可用的 VLAN 开关属性，无法启用 VLAN 标签")
         else:
-            value, text = choose_vlan_mode_value(inspector.vlan_mode_prop, enable=True)
-            if value is None:
-                log("⚠️ 无法从合法取值中确定 VLAN 开关的启用值，跳过")
-            else:
-                ops.append({"role": "vlan_mode", "kw": inspector.role_keyword("vlan_mode"),
-                            "mode": "set", "val": value})
-                log("ℹ️ VLAN 开关将设为: %s (RegistryValue=%s)" % (text, value))
-        if not inspector.ok or not inspector.vlan_id_prop:
+            requests.append({"role": "vlan_mode", "kind": "enable"})
+        if not inspector.ok or not inspector.role_candidates("vlan_id"):
             log("⚠️ 该网卡驱动未提供可设置的 VLAN ID 属性"
                 "（例如 Intel I219-V；Realtek 为 RegVlanID、ASIX 为 VLAN_ID）")
             log("   若设备必须带 VLAN，请改用支持 VLAN ID 的网卡或在交换机侧配置")
         else:
-            ops.append({"role": "vlan_id", "kw": inspector.role_keyword("vlan_id"),
-                        "mode": "set", "val": vlan_value})
+            requests.append({"role": "vlan_id", "kind": "set", "value": vlan_value})
             expected.append("VLAN=%s" % vlan_value)
 
-    # ---- 写入高级属性 ----
-    if ops:
+    # ---- 写入高级属性（候选自动试错 + 回读校验 + 成功即自动记入本地档案）----
+    if requests:
         log("[1/5] 写入 MAC / VLAN 高级属性……")
-        needs_restart = _report_ops(apply_property_ops(iface, ops), log)
+        results = try_roles(iface, inspector, requests, log)
+        needs_restart = any(item.get("ok") for item in results.values())
+        _persist_learned(inspector, results, iface, log)
     else:
         log("[1/5] 无 MAC/VLAN 属性需要写入")
 

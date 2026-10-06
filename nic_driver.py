@@ -46,14 +46,29 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 
 # ----------------------------------------------------------------------------
 # 常量配置
 # ----------------------------------------------------------------------------
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+def app_dir():
+    """
+    程序所在目录——所有「用户可编辑/可写」的文件都放这里。
+
+    PyInstaller 打包后 __file__ 指向临时解包目录（每次启动都不同），必须改用 exe
+    所在目录，否则 configs.json / driver_profiles.json 会读不到或写进临时目录。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_HERE = app_dir()
 PROFILE_FILE = os.path.join(_HERE, "driver_profiles.json")
+# 运行时自动学习出的档案（每台机器独有，不进仓库）；优先级高于上面的公共档案
+LOCAL_PROFILE_FILE = os.path.join(_HERE, "driver_profiles.local.json")
 
 # 角色 -> RegistryKeyword 候选（按优先级排列；比较时忽略大小写与前导 *）
 ROLE_KEYWORDS = {
@@ -215,19 +230,8 @@ def run_ps_json(script, timeout=_PS_TIMEOUT):
 # 驱动档案（driver_profiles.json）
 # ----------------------------------------------------------------------------
 
-def load_profiles(path=PROFILE_FILE):
-    """
-    读取驱动档案。结构：
-        {
-          "profiles": {
-            "ASIX USB to Gigabit Ethernet Family Adapter": {
-              "mac": "NetworkAddress", "vlan_mode": "*PriorityVLANTag", "vlan_id": "VLAN_ID"
-            },
-            "某驱动型号": {"vlan_id": null}      # null = 明确声明该驱动不支持此角色
-          }
-        }
-    文件不存在或格式错误时返回空档案（不影响内置关键字表工作）。
-    """
+def _read_profile_file(path):
+    """读单个档案文件，返回 {驱动型号: {角色: 关键字}}。"""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
@@ -236,7 +240,90 @@ def load_profiles(path=PROFILE_FILE):
     profiles = raw.get("profiles", raw) if isinstance(raw, dict) else {}
     if not isinstance(profiles, dict):
         return {}
-    return {k: v for k, v in profiles.items() if not str(k).startswith("_") and isinstance(v, dict)}
+    return {k: v for k, v in profiles.items()
+            if not str(k).startswith("_") and isinstance(v, dict)}
+
+
+def load_profiles(path=None):
+    """
+    读取驱动档案。path 为 None 时合并两个文件（本地自动学习的优先）：
+
+      ① driver_profiles.local.json —— 程序运行时自动探测/校验成功后落盘，每台机器独有，
+         用户完全无感知；插过的网卡下次直接命中。
+      ② driver_profiles.json       —— 随程序分发的公共档案，可手工补充、可分享给同事。
+
+    结构：
+        {
+          "profiles": {
+            "ASIX USB to Gigabit Ethernet Family Adapter": {
+              "mac": "NetworkAddress", "vlan_mode": "*PriorityVLANTag", "vlan_id": "VLAN_ID"
+            },
+            "某驱动型号": {"vlan_id": null}      # null = 明确声明该驱动不支持此角色
+          }
+        }
+    """
+    if path is not None:
+        return _read_profile_file(path)
+    merged = _read_profile_file(PROFILE_FILE)
+    merged.update(_read_profile_file(LOCAL_PROFILE_FILE))
+    return merged
+
+
+def persist_profile(description, role_keywords, path=LOCAL_PROFILE_FILE, interface=None):
+    """
+    把某张网卡识别成功的关键字写入本地档案，实现「用过一次就永远记住，用户零操作」。
+
+    返回 True 表示本次确实写入且内容有更新；False 表示无变化或写入失败。
+    任何异常都被吞掉——绝不能让档案写入影响配置流程。
+    """
+    description = (description or "").strip()
+    learned = {role: kw for role, kw in (role_keywords or {}).items() if kw}
+    if not description or not learned:
+        return False
+    try:
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle) or {}
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+        entry = profiles.get(description)
+        if not isinstance(entry, dict):
+            entry = {}
+        changed = any(entry.get(role) != kw for role, kw in learned.items())
+        entry.update(learned)
+        profiles[description] = entry
+        data["profiles"] = profiles
+
+        meta = data.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        record = meta.get(description)
+        if not isinstance(record, dict):
+            record = {}
+        interfaces = record.get("interfaces")
+        if not isinstance(interfaces, list):
+            interfaces = []
+        if interface and interface not in interfaces:
+            interfaces.append(interface)
+        record["interfaces"] = interfaces
+        record["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        meta[description] = record
+        data["_meta"] = meta
+
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        return changed
+    except Exception:
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -327,6 +414,7 @@ class AdapterInspector:
         self.profile_name = None
         self.profile = {}
         self._roles = {}
+        self._role_source = {}
         if discover:
             self.discover()
 
@@ -395,20 +483,26 @@ class AdapterInspector:
                     pass
         return best
 
-    # ---------- 三级匹配 ----------
+    # ---------- 四级匹配 ----------
     def _resolve_role(self, role):
+        prop, source = self._resolve_role_best(role)
+        self._role_source[role] = source
+        return prop
+
+    def _resolve_role_best(self, role):
+        """返回 (属性, 来源)。来源用于日志展示与是否需要落盘学习。"""
         # ① 驱动档案指定（null / "" 表示该驱动不支持此角色）
         if role in self.profile:
             keyword = self.profile.get(role)
             if keyword is None or str(keyword).strip() == "":
-                return None
+                return None, "unsupported"
             wanted = _norm_kw(keyword)
             for prop in self.props:
                 if _norm_kw(prop.get("RegistryKeyword")) == wanted:
-                    return prop
+                    return prop, "profile"
             for prop in self.props:  # 允许档案写子串
                 if wanted and wanted in _norm_kw(prop.get("RegistryKeyword")):
-                    return prop
+                    return prop, "profile"
         # ② 内置关键字候选表（按候选顺序取最优）
         best, best_rank = None, 10 ** 6
         for prop in self.props:
@@ -416,12 +510,54 @@ class AdapterInspector:
             if rank is not None and rank < best_rank:
                 best, best_rank = prop, rank
         if best is not None:
-            return best
-        # ③ 显示名多语言兜底
+            return best, "keyword"
+        # ③ 显示名多语言匹配
         for prop in self.props:
             if _display_match(role, prop.get("DisplayName")):
-                return prop
-        return None
+                return prop, "display"
+        # ④ 语义推断：不看具体名字，只看关键字片段 + 属性类型 + 取值域
+        inferred = _semantic_infer(role, self.props)
+        if inferred:
+            return inferred[0], "inferred"
+        return None, "missing"
+
+    def role_source(self, role):
+        """该角色是靠什么识别出来的：profile/keyword/display/inferred/unsupported/missing。"""
+        return self._role_source.get(role, "missing")
+
+    def role_candidates(self, role):
+        """
+        返回该角色的有序候选属性列表（按 RegistryKeyword 去重）。
+
+        顺序：档案/内置表/显示名命中的首选 → 内置表其它命中 → 显示名命中 → 语义推断命中。
+        用途：写入失败或回读校验不一致时，自动换下一个候选重试——这就是"猜不到就试出来"。
+        """
+        if role in self.profile and (self.profile.get(role) is None
+                                     or str(self.profile.get(role)).strip() == ""):
+            return []  # 档案明确声明该驱动不支持此角色
+
+        result, seen = [], set()
+
+        def _add(prop):
+            if not isinstance(prop, dict):
+                return
+            key = _norm_kw(prop.get("RegistryKeyword"))
+            if not key or key in seen:
+                return
+            seen.add(key)
+            result.append(prop)
+
+        _add(self.prop(role))
+        for rank in range(len(ROLE_KEYWORDS.get(role, []))):
+            for prop in self.props:
+                if self._keyword_rank(role, prop.get("RegistryKeyword")) == rank:
+                    _add(prop)
+        for prop in self.props:
+            if _display_match(role, prop.get("DisplayName")):
+                _add(prop)
+        for prop in _semantic_infer(role, self.props):
+            _add(prop)
+        return result
 
     @staticmethod
     def _keyword_rank(role, keyword):
@@ -491,6 +627,117 @@ def _display_match(role, display_name):
             or ("packet" in compact) or ("tag" in compact)
         return has_vlan and has_tag
     return False
+
+
+# ----------------------------------------------------------------------------
+# 语义推断：完全不比对固定名字，只看「关键字段 + 属性类型 + 取值域」
+# ----------------------------------------------------------------------------
+
+# MAC 属性的排除词（含这些词的多半是 IP / DNS / 唤醒 / 分载 等其它属性）
+_MAC_EXCLUDE_RE = re.compile(
+    r"(ipv4|ipv6|dns|gateway|mask|wake|wol|arp|checksum|offload|jumbo|flow|buffer|"
+    r"power|vlan|speed|duplex|moderation|timestamp)",
+    re.IGNORECASE,
+)
+_VLAN_PRIORITY_RE = re.compile(r"(priority|优先|優先|packetpriority)", re.IGNORECASE)
+
+
+def _is_enum_prop(prop):
+    """枚举型属性（带合法取值列表）；NetworkAddress 这类 edit 型属性没有取值列表。"""
+    return bool(_as_list(prop.get("ValidDisplayValues"))) or \
+        bool(_as_list(prop.get("ValidRegistryValues")))
+
+
+def _looks_like_vlan_id(keyword, display):
+    kw = _norm_kw(keyword)
+    low = str(display or "").lower()
+    compact = re.sub(r"[\s\u00a0_\-]+", "", low)
+    if "vlan" not in kw and "vlan" not in compact \
+            and "标识" not in compact and "標識" not in compact:
+        return False
+    if "id" in kw or "标识" in compact or "標識" in compact:
+        return True
+    return bool(re.search(r"\bid\b", low))
+
+
+def _semantic_infer(role, props):
+    """
+    语义推断（第四级，兜底中的兜底）。
+
+    不比对任何固定名字，而是按「关键字段 + 属性类型 + 取值域」判断，因此
+    RegVlanID / VLAN_ID / VlanTagId / *PriorityVLANTag / PriorityVLANTag 这类
+    五花八门的关键字都能命中，不需要人工维护列表：
+
+      VLAN ID   : 名字含 vlan 且不是"优先级"类；名字含 id/标识（整数型优先）
+      VLAN 开关 : 名字含 vlan 且是枚举型（有合法取值）；优先级类(VLAN Tag)排最前
+      MAC       : 编辑型(非枚举) 且名字含 address/地址，且不含 IP/DNS/唤醒/分载 等排除词
+    """
+    found = []
+    for prop in props:
+        keyword = _norm_kw(prop.get("RegistryKeyword"))
+        display = str(prop.get("DisplayName") or "")
+        low = display.lower()
+        compact = re.sub(r"[\s\u00a0_\-]+", "", low)
+        has_vlan = ("vlan" in keyword) or ("vlan" in compact) \
+            or ("标识" in compact) or ("標識" in compact)
+        is_enum = _is_enum_prop(prop)
+
+        if role == "vlan_id":
+            if not has_vlan or _VLAN_PRIORITY_RE.search(keyword) \
+                    or _VLAN_PRIORITY_RE.search(compact):
+                continue
+            if _looks_like_vlan_id(keyword, display):
+                found.append(prop)
+            elif (not is_enum) and ("tag" in keyword or "tag" in compact):
+                found.append(prop)
+
+        elif role == "vlan_mode":
+            if not has_vlan or not is_enum:
+                continue
+            if _VLAN_PRIORITY_RE.search(keyword) or _VLAN_PRIORITY_RE.search(compact):
+                found.append(prop)      # *PriorityVLANTag 这一类，最可靠的 VLAN 开关
+            elif _looks_like_vlan_id(keyword, display):
+                continue                # 更像 VLAN ID，不是开关
+            elif "tag" in keyword or "tag" in compact or "enable" in keyword:
+                found.append(prop)
+
+        elif role == "mac":
+            if is_enum:
+                continue
+            if _MAC_EXCLUDE_RE.search(keyword) or _MAC_EXCLUDE_RE.search(compact):
+                continue
+            if ("address" in keyword) or ("address" in compact) \
+                    or ("地址" in compact) or ("位址" in compact):
+                found.append(prop)
+
+    def _score(prop):
+        keyword = _norm_kw(prop.get("RegistryKeyword")).replace("_", "")
+        if role == "mac":
+            if "networkaddress" in keyword:
+                return 0
+            return 1 if "address" in keyword else 2
+        if role == "vlan_id":
+            if "vlanid" in keyword:
+                return 0
+            return 1 if "id" in keyword else 2
+        if role == "vlan_mode":
+            if "priorityvlantag" in keyword:
+                return 0
+            return 1 if "vlantag" in keyword else 2
+        return 3
+
+    return sorted(found, key=_score)
+
+
+# 识别来源的中文标注（日志用）
+SOURCE_LABEL = {
+    "profile": "驱动档案",
+    "keyword": "内置关键字表",
+    "display": "显示名多语言匹配",
+    "inferred": "语义推断（自动学习）",
+    "unsupported": "档案标注：该驱动不支持",
+    "missing": "未找到",
+}
 
 
 def choose_vlan_mode_value(prop, enable=True):
@@ -591,6 +838,7 @@ $json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64Strin
 $parsed = ConvertFrom-Json -InputObject $json
 $results = @()
 foreach ($op in $parsed) {
+    $readback = $null
     try {
         if ($op.mode -eq 'reset') {
             Get-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $op.kw -IncludeHidden -ErrorAction Stop |
@@ -598,9 +846,12 @@ foreach ($op in $parsed) {
         } else {
             Set-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $op.kw -RegistryValue $op.val -NoRestart -ErrorAction Stop
         }
-        $results += @{ role = [string]$op.role; kw = [string]$op.kw; ok = $true; msg = '' }
+        $one = Get-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $op.kw -IncludeHidden -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($one) { $readback = [string]$one.RegistryValue }
+        $results += @{ role = [string]$op.role; kw = [string]$op.kw; ok = $true; msg = ''; readback = $readback }
     } catch {
-        $results += @{ role = [string]$op.role; kw = [string]$op.kw; ok = $false; msg = $_.Exception.Message }
+        $results += @{ role = [string]$op.role; kw = [string]$op.kw; ok = $false; msg = $_.Exception.Message; readback = $null }
     }
 }
 @{ ok = $true; results = @($results) } | ConvertTo-Json -Depth 6 -Compress
@@ -609,10 +860,164 @@ foreach ($op in $parsed) {
     data = run_ps_json(script, timeout=timeout)
     if not data.get("ok"):
         return [{"role": op.get("role", "?"), "kw": op.get("kw", "?"), "ok": False,
-                 "msg": str(data.get("error") or "批量写入失败")} for op in ops]
+                 "msg": str(data.get("error") or "批量写入失败"),
+                 "readback": None, "verified": False} for op in ops]
     results = [r for r in _as_list(data.get("results")) if isinstance(r, dict)]
-    return results or [{"role": op.get("role", "?"), "kw": op.get("kw", "?"), "ok": False,
-                        "msg": "未返回结果"} for op in ops]
+    if not results:
+        results = [{"role": op.get("role", "?"), "kw": op.get("kw", "?"), "ok": False,
+                    "msg": "未返回结果"} for op in ops]
+    # 写进去还不够：回读注册表值，确认真的变成了我们写入的值
+    for index, item in enumerate(results):
+        op = ops[index] if index < len(ops) else {}
+        item.setdefault("readback", None)
+        item["verified"] = bool(item.get("ok")) and _readback_matches(op, item.get("readback"))
+    return results
+
+
+def _readback_matches(op, readback):
+    """回读值是否等于写入值（忽略大小写与分隔符；恢复默认只需写入未报错）。"""
+    if op.get("mode") == "reset":
+        return True
+    want = op.get("val")
+    if want is None:
+        return True
+    clean = lambda value: re.sub(r"[^0-9a-z]", "", str(value).lower())  # noqa: E731
+    got_clean, want_clean = clean(readback), clean(want)
+    if not got_clean:
+        return False
+    return got_clean == want_clean or want_clean in got_clean
+
+
+def _build_op(request, prop):
+    """按请求与候选属性构造一次写入操作；无法构造时返回 None。"""
+    keyword = prop.get("RegistryKeyword")
+    if not keyword:
+        return None
+    kind = request.get("kind", "set")
+    if kind == "reset":
+        return {"role": request["role"], "kw": keyword, "mode": "reset", "verify": True}
+    if kind == "set":
+        return {"role": request["role"], "kw": keyword, "mode": "set",
+                "val": request.get("value"), "verify": True}
+    if kind in ("enable", "disable"):
+        value, text = choose_vlan_mode_value(prop, enable=(kind == "enable"))
+        if value is None:
+            if request.get("fallback_reset"):
+                return {"role": request["role"], "kw": keyword, "mode": "reset", "verify": True}
+            return None
+        return {"role": request["role"], "kw": keyword, "mode": "set",
+                "val": value, "verify": True, "text": text}
+    return None
+
+
+def try_roles(iface, inspector, requests, log=None, max_attempts=3, timeout=140):
+    """
+    按候选顺序试写角色属性，写入后回读校验，失败自动换下一个候选——"猜不到就试出来"。
+
+    requests: [{"role": "mac", "kind": "set", "value": "0a0b0c026969"},
+               {"role": "vlan_mode", "kind": "enable"},
+               {"role": "vlan_id", "kind": "set", "value": 105}]
+              kind 可为 set / reset / enable / disable。
+
+    返回 {role: {"ok", "keyword", "readback", "source", "message", ...}}。
+    多个请求会合并成一次 PowerShell 调用；只有失败的才进入下一轮候选。
+    """
+    log = as_log(log) if log is not None else (lambda message: None)
+    results = {}
+    pending = [dict(request) for request in requests]
+    for attempt in range(max_attempts):
+        if not pending:
+            break
+        ops, groups, retry = [], [], []
+        for request in pending:
+            role = request["role"]
+            candidates = inspector.role_candidates(role)
+            if attempt >= len(candidates):
+                continue  # 该角色没有第 attempt 个候选，稍后按失败处理
+            prop = candidates[attempt]
+            op = _build_op(request, prop)
+            if op is None:
+                if attempt + 1 < len(candidates):
+                    retry.append(request)
+                continue
+            ops.append(op)
+            groups.append((request, prop, op))
+        if not ops:
+            pending = retry
+            continue
+        batch = apply_property_ops(iface, ops, timeout=timeout)
+        for (request, prop, op), item in zip(groups, batch):
+            role = request["role"]
+            keyword = op.get("kw")
+            if item.get("ok") and item.get("verified"):
+                results[role] = {
+                    "role": role, "ok": True, "keyword": keyword,
+                    "display": prop.get("DisplayName"), "value": op.get("val"),
+                    "mode": op.get("mode"), "readback": item.get("readback"),
+                    "text": op.get("text"), "source": inspector.role_source(role),
+                    "attempt": attempt, "message": "",
+                }
+                log("   ✅ %s → %s 写入成功且回读一致%s"
+                    % (ROLE_LABEL.get(role, role), keyword,
+                       "" if attempt == 0 else "（第 %d 个候选）" % (attempt + 1)))
+            else:
+                reason = item.get("msg") or "回读值 %r 与写入值不一致" % (item.get("readback"),)
+                log("   ⚠️ %s → %s 未生效: %s" % (ROLE_LABEL.get(role, role), keyword, reason))
+                if attempt + 1 < len(inspector.role_candidates(role)):
+                    retry.append(request)
+                else:
+                    results[role] = {"role": role, "ok": False, "keyword": keyword,
+                                     "source": inspector.role_source(role), "message": reason}
+        pending = retry
+    for request in pending:
+        role = request["role"]
+        if role not in results:
+            results[role] = {"role": role, "ok": False, "keyword": None,
+                             "source": inspector.role_source(role),
+                             "message": "所有候选属性都未通过写入/回读校验"}
+    return results
+
+
+# ----------------------------------------------------------------------------
+# 一键适配：探测 + 语义推断 + 自动落盘学习（不改动网卡任何设置）
+# ----------------------------------------------------------------------------
+
+def adapt_adapter(iface, log=None, inspector=None):
+    """
+    一键适配此网卡：探测驱动属性 → 逐角色识别（档案/关键字表/显示名/语义推断）
+    → 把识别结果写入本地档案 driver_profiles.local.json。
+
+    整个过程**不修改网卡任何设置**，纯读操作；用户下一次点【应用配置】即可直接生效。
+    返回 {"ok", "description", "keywords": {...}, "sources": {...}, "written"}。
+    """
+    log = as_log(log) if log is not None else (lambda message: None)
+    inspector = inspector or AdapterInspector(iface)
+    if not inspector.ok:
+        log("⚠️ 探测失败: %s" % inspector.error)
+        return {"ok": False, "error": inspector.error}
+
+    log("网卡: %s ｜ 接口: %s" % (inspector.description or "未知", iface))
+    learned, sources = {}, {}
+    for role in ("mac", "vlan_mode", "vlan_id"):
+        prop = inspector.prop(role)
+        source = inspector.role_source(role)
+        sources[role] = source
+        if prop:
+            learned[role] = prop.get("RegistryKeyword")
+            log("  %s: %s（来源: %s ｜ 显示名: %s）"
+                % (ROLE_LABEL[role], prop.get("RegistryKeyword"),
+                   SOURCE_LABEL.get(source, source), prop.get("DisplayName")))
+        else:
+            log("  %s: 该驱动未提供（%s）" % (ROLE_LABEL[role], SOURCE_LABEL.get(source, source)))
+
+    written = persist_profile(inspector.description or iface, learned, interface=iface)
+    if learned:
+        log("本地档案 driver_profiles.local.json: %s"
+            % ("已更新（下次插同一张网卡自动命中）" if written else "已是最新，无需更新"))
+    else:
+        log("⚠️ 未能识别出任何属性，请把导出的探测文件发给开发者补充档案")
+    return {"ok": True, "description": inspector.description, "keywords": learned,
+            "sources": sources, "written": written}
 
 
 def restart_adapter(iface, wait_up=25, timeout=120):

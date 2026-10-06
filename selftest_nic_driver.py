@@ -153,6 +153,110 @@ logger = nd.as_log(fake)
 logger("兼容旧调用")
 check("as_log 兼容 Tk Text 控件", "".join(fake.buf).strip(), "兼容旧调用")
 
+# ---- 语义推断：不看固定名字，只看「类型 + 取值域」（新网卡自动适配的关键） ----
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
+import shutil as _shutil  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+
+
+def _prop(display, keyword, enum=False):
+    item = {"DisplayName": display, "RegistryKeyword": keyword}
+    if enum:
+        item["ValidDisplayValues"] = ["已禁用", "已启用"]
+        item["ValidRegistryValues"] = [0, 1]
+    return item
+
+
+tricky = [
+    _prop("VLAN ID", "RegVlanID"),
+    _prop("VLAN标识", "VLAN_ID"),
+    _prop("VLAN Tag Id", "VlanTagId"),
+    _prop("Packet Priority & VLAN", "*PriorityVLANTag", enum=True),
+    _prop("Priority & VLAN", "PriorityVLANTag", enum=True),
+    _prop("Network Address", "NetworkAddress"),
+    _prop("本地管理地址", "NetworkAddress2"),
+    _prop("流量控制", "*FlowControl", enum=True),
+    _prop("Wake on Magic Packet", "*WakeOnMagicPacket", enum=True),
+]
+
+inferred_ids = sorted(p["RegistryKeyword"] for p in nd._semantic_infer("vlan_id", tricky))
+check("语义推断 vlan_id：命中 3 个 ID 类、不含开关", inferred_ids,
+      ["RegVlanID", "VLAN_ID", "VlanTagId"])
+
+inferred_modes = [p["RegistryKeyword"] for p in nd._semantic_infer("vlan_mode", tricky)]
+check("语义推断 vlan_mode：只命中两个开关", inferred_modes,
+      ["*PriorityVLANTag", "PriorityVLANTag"])
+
+inferred_macs = [p["RegistryKeyword"] for p in nd._semantic_infer("mac", tricky)]
+check("语义推断 mac：只命中 address 类，排除干扰项", inferred_macs,
+      ["NetworkAddress", "NetworkAddress2"])
+
+# ---- 候选列表与识别来源 ----
+insp_c = nd.AdapterInspector("以太网 13", profiles={}, discover=False)
+insp_c.ok = True
+insp_c.profile = {}
+insp_c.props = tricky
+for role in nd.ROLE_KEYWORDS:
+    insp_c._roles[role] = insp_c._resolve_role(role)
+check("候选列表首选 == 识别结果", insp_c.role_candidates("vlan_id")[0]["RegistryKeyword"],
+      insp_c.role_keyword("vlan_id"))
+check("候选列表按关键字去重",
+      len(insp_c.role_candidates("vlan_mode"))
+      == len({nd._norm_kw(p["RegistryKeyword"]) for p in insp_c.role_candidates("vlan_mode")}),
+      True)
+check("识别来源：内置关键字表", insp_c.role_source("vlan_id"), "keyword")
+
+# 全新的、任何候选表里都没有的关键字，也必须能靠语义推断认出来
+insp_i = nd.AdapterInspector("以太网 99", profiles={}, discover=False)
+insp_i.ok = True
+insp_i.profile = {}
+insp_i.props = [_prop("未知属性A", "FooVlanIdNo"),
+                _prop("未知属性B", "BarPriorityVlanTag", enum=True)]
+for role in nd.ROLE_KEYWORDS:
+    insp_i._roles[role] = insp_i._resolve_role(role)
+check("全新关键字也能认出 VLAN ID", insp_i.role_keyword("vlan_id"), "FooVlanIdNo")
+check("全新关键字也能认出 VLAN 开关", insp_i.role_keyword("vlan_mode"), "BarPriorityVlanTag")
+check("识别来源：语义推断", insp_i.role_source("vlan_id"), "inferred")
+
+# 档案里写 null = 明确声明该驱动不支持，候选列表必须为空（不再瞎猜）
+insp_null = nd.AdapterInspector("以太网", profiles={}, discover=False)
+insp_null.profile = {"vlan_id": None}
+insp_null.props = tricky
+check("档案声明 null 时候选列表为空", insp_null.role_candidates("vlan_id"), [])
+
+# ---- 写入回读校验 ----
+check("回读校验：数值一致", nd._readback_matches({"val": 105}, "105"), True)
+check("回读校验：MAC 忽略大小写与分隔符",
+      nd._readback_matches({"val": "0a0b0c026969"}, "0A-0B-0C-02-69-69"), True)
+check("回读校验：不一致判失败", nd._readback_matches({"val": 105}, "0"), False)
+check("回读校验：回读为空判失败", nd._readback_matches({"val": "0a0b0c026969"}, None), False)
+check("回读校验：reset 模式视为成功", nd._readback_matches({"mode": "reset"}, None), True)
+
+# ---- 自动落盘学习（用程序目录下的临时文件，绝不碰真实的 driver_profiles.local.json） ----
+_here = _os.path.dirname(_os.path.abspath(__file__))
+_fd, tmp_file = _tempfile.mkstemp(prefix="_admlc_profile_test_", suffix=".json", dir=_here)
+_os.close(_fd)
+_os.remove(tmp_file)  # persist_profile 会自己创建该文件
+first_write = nd.persist_profile("Test NIC", {"mac": "NetworkAddress", "vlan_id": "VLAN_ID"},
+                                 path=tmp_file, interface="以太网 9")
+second_write = nd.persist_profile("Test NIC", {"mac": "NetworkAddress", "vlan_id": "VLAN_ID"},
+                                  path=tmp_file, interface="以太网 9")
+reloaded = nd.load_profiles(path=tmp_file)
+check("落盘：首次写入返回已更新", first_write, True)
+check("落盘：重复写入返回无变化", second_write, False)
+check("落盘：内容可按档案格式读回", reloaded.get("Test NIC"),
+      {"mac": "NetworkAddress", "vlan_id": "VLAN_ID"})
+with open(tmp_file, "r", encoding="utf-8") as handle:
+    raw_profile = _json.load(handle)
+check("落盘：记录了使用过的网口名",
+      raw_profile["_meta"]["Test NIC"]["interfaces"], ["以太网 9"])
+for _leftover in (tmp_file, tmp_file + ".tmp"):
+    try:
+        _os.remove(_leftover)
+    except OSError:
+        pass
+
 # ---- 驱动档案文件结构 ----
 check("profiles 结构正确", all(isinstance(v, dict) for v in profiles.values()), True)
 

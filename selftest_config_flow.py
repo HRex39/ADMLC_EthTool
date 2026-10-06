@@ -66,6 +66,13 @@ class FakeInspector:
         p = self.prop(role)
         return p.get("DisplayValue") if p else None
 
+    def role_candidates(self, role):
+        p = self.prop(role)
+        return [p] if p else []
+
+    def role_source(self, role):
+        return "profile" if self.prop(role) else "missing"
+
     @property
     def mac_prop(self):
         return self.prop("mac")
@@ -100,9 +107,17 @@ def install_stubs(inspector_cls, log_sink, ops_sink):
 
     def fake_apply_property_ops(iface, ops, timeout=120):
         ops_sink.extend(ops)
-        return [{"role": op["role"], "kw": op["kw"], "ok": True, "msg": ""} for op in ops]
+        return [{"role": op["role"], "kw": op["kw"], "ok": True, "msg": "",
+                 "readback": op.get("val"), "verified": True} for op in ops]
 
-    wc.apply_property_ops = fake_apply_property_ops
+    # try_roles 在 nic_driver 内部调用 apply_property_ops，所以必须打在 nic_driver 上
+    nd.apply_property_ops = fake_apply_property_ops
+
+    def fake_persist(description, role_keywords, path=None, interface=None):
+        log_sink("  [stub] 落盘档案 %s -> %s" % (description, role_keywords))
+        return True
+
+    nd.persist_profile = fake_persist  # 别在测试中真的写出 driver_profiles.local.json
 
 
 # ================= TEST 模式：ASIX（应写 MAC + VLAN开关=3 + VLAN_ID=105，并重启） =================
@@ -122,6 +137,7 @@ check("TEST: 已自动重启网卡", any("[stub] 重启网卡" in x for x in lin
 check("TEST: 已设置静态 IP", any("static" in x and "172.16.105.105" in x for x in lines))
 check("TEST: 已写入静态 ARP", any("172.16.105.26" in x for x in lines))
 check("TEST: 探测到驱动型号", any("ASIX USB to Gigabit Ethernet" in x for x in lines))
+check("TEST: 成功的关键字已自动落盘学习", any("[stub] 落盘档案" in x and "VLAN_ID" in x for x in lines))
 
 # ================= TEST 模式：Intel I219-V（无 VLAN ID，应明确提示并跳过） =================
 lines2, ops2 = [], []

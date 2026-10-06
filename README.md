@@ -41,7 +41,8 @@ python main.py
 | 文件 | 作用 |
 |---|---|
 | `configs.json` | 配置预设（`mode` / `ip` / `netmask` / `gateway` / `vlan_id` / `mac` / `arp`）。`"auto"` 表示交给系统自动协商 |
-| `driver_profiles.json` | **网卡驱动关键字档案**：按驱动型号指定 MAC / VLAN 属性对应的注册表关键字，遇到新网卡只加一行即可，不用改代码 |
+| `driver_profiles.json` | **网卡驱动关键字档案**（随程序分发）：按驱动型号指定 MAC / VLAN 属性对应的注册表关键字，可手工补充、可分享给同事 |
+| `driver_profiles.local.json` | **自动学习的档案**（首次使用后自动生成，不进仓库）：点过【一键适配此网卡】或成功应用过配置的网卡会自动记在这里，下次插同一张卡直接命中 |
 
 配置项补充说明：
 
@@ -63,8 +64,28 @@ python main.py
 
 > 注意 `RegVlanID` 这类关键字无法通过"名字列表"猜到，这正是必须用关键字探测 + 档案兜底的原因。
 
-匹配优先级：`driver_profiles.json` → 内置关键字候选表 → 显示名多语言兜底。
-完整说明与新增网卡的步骤见 [`docs/drivers.md`](docs/drivers.md)。
+匹配优先级：`driver_profiles.local.json`（自动学习）→ `driver_profiles.json`（公共档案）
+→ 内置关键字候选表 → 显示名多语言匹配 → **语义推断**。
+
+### 新网卡零操作适配
+
+插上一张没见过的网卡，**不需要编辑任何文件**：
+
+1. 点【刷新网口】选中它，点【一键适配此网卡】（纯读取，不改动网卡任何设置）；
+2. 程序按四级顺序自动识别 MAC / VLAN 开关 / VLAN ID，并显示**每个属性是靠什么识别出来的**；
+3. 识别结果自动写入 `driver_profiles.local.json`，下次插同一张卡直接命中；
+4. 点【应用配置】即可。
+
+写入时还会做**回读校验 + 候选自动重试**：写完立刻读回注册表确认真的生效，
+不一致就自动换下一个候选属性重试；只有全部候选都失败才判定"该驱动不支持"。
+因此剩下需要人工介入的，只有"驱动确实没有这个属性"（例如 Intel I219-V 没有 VLAN ID），
+程序会明确把这一点打印出来。
+
+语义推断不看固定名字，而是按「关键字段 + 属性类型 + 取值域」判断，所以
+`VLAN_ID` / `RegVlanID` / `VlanTagId` / `*PriorityVLANTag` / `PriorityVLANTag`
+这类五花八门的关键字都能自动命中，这正是"猜不到就试出来"的兜底。
+
+完整说明见 [`docs/drivers.md`](docs/drivers.md)。
 
 ## 目录结构
 
@@ -74,18 +95,21 @@ nic_driver.py         网卡高级属性解析引擎（关键字优先，跨厂�
 windows_config.py     Windows 配置编排（IP/MAC/VLAN/ARP + 网卡重启）
 linux_config.py       Linux 配置编排（ip 命令）
 sftp_browser.py       SFTP 浏览器窗口
-driver_profiles.json  驱动关键字档案（可按需扩充）
+driver_profiles.json  驱动关键字档案（可按需扩充，可分享）
 configs.json          配置预设
 docs/drivers.md       驱动适配说明与关键字对照表
-selftest_nic_driver.py   离线自检：关键字匹配与取值逻辑（不接触真实网卡）
+build.txt             打包成 exe 的手动构建说明
+selftest_nic_driver.py   离线自检：关键字匹配、语义推断与取值逻辑
 selftest_config_flow.py  离线自检：配置编排流程（monkeypatch 掉系统调用，零副作用）
 ```
+
+> `driver_profiles.local.json` 会在首次使用时自动生成（自动学习的网卡档案），不需要手工创建。
 
 ## 自检
 
 ```bash
-python selftest_nic_driver.py     # 解析逻辑：34 项
-python selftest_config_flow.py    # 编排流程：21 项
+python selftest_nic_driver.py     # 解析逻辑：53 项
+python selftest_config_flow.py    # 编排流程：23 项
 ```
 
 两个脚本都不依赖真实网卡、不改动系统，改完代码跑一遍即可回归。覆盖：

@@ -26,3 +26,9 @@ Thumbs.db
 
 # 驱动探测导出的诊断文件（点了【探测驱动属性】会生成，含本机网卡信息）
 driver_probe_*.json
+
+# 运行时自动学习出的驱动档案（每台机器独有，不共享、不入库）
+driver_profiles.local.json
+
+# 自检脚本的临时文件（正常跑完会自动删除，异常中断时可能残留）
+_admlc_profile_test_*

@@ -1,0 +1,75 @@
+网口配置工具 —— 手动构建说明（Windows + PyInstaller）
+======================================================
+
+一、准备（只需一次）
+--------------------
+1) 确认 Python 可用（3.9+，本机实测 3.14）：
+       python --version
+2) 安装运行依赖与打包工具（在项目根目录执行，即本文件所在目录）：
+       pip install -r requirements.txt
+       pip install pyinstaller
+
+
+二、构建（每次改完代码执行）
+----------------------------
+在项目根目录执行（cmd 下用 ^ 续行；PowerShell 请改成一行或用 ` 续行）：
+
+    pyinstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+        --name ADMLC_EthTool ^
+        --collect-submodules paramiko ^
+        --collect-submodules cryptography ^
+        main.py
+
+参数说明：
+    --onefile      打成单个 exe
+    --windowed     不弹黑色控制台窗口
+    --uac-admin    双击即请求管理员权限（本工具要改网卡，必须提权）
+    --collect-submodules paramiko / cryptography   防止 paramiko 的后端被漏收
+                    （漏收的典型症状：运行时报 No module named 'bcrypt'/'nacl'）
+
+产物：dist\ADMLC_EthTool.exe
+
+更推荐内部批量分发的替代方案（启动快、杀软误报少）：
+
+    pyinstaller --noconfirm --clean --onedir --windowed --uac-admin ^
+        --name ADMLC_EthTool --collect-submodules paramiko main.py
+
+产物：dist\ADMLC_EthTool\ 整个文件夹（内含 exe）
+
+
+三、分发（重要，务必照做）
+--------------------------
+把下面这些文件放进【同一个目录】再发给使用者：
+
+    ADMLC_EthTool.exe
+    configs.json              <- 配置预设，使用者可自行编辑
+    driver_profiles.json      <- 驱动关键字档案，使用者可自行编辑/扩充
+
+说明：
+  * driver_profiles.local.json 由程序首次使用时自动生成（自动学习的网卡档案），
+    不要手工创建，也不要分发；想分享给同事时再把这个文件里的 profiles 合并进
+    driver_profiles.json 即可。
+  * driver_probe_*.json 是【探测驱动属性】导出的诊断文件，无需分发。
+  * 程序已按 sys.frozen 处理路径：会读取 exe 所在目录的 json，
+    所以不要把 json 打进 exe 内部（否则使用者改不了配置）。
+
+
+四、带图标（可选）
+------------------
+    pyinstaller ... --icon app.ico main.py
+
+
+五、打包前自检（建议每次改完代码先跑）
+--------------------------------------
+    python selftest_nic_driver.py      # 解析/推断/落盘逻辑，53 项
+    python selftest_config_flow.py     # 配置编排流程，23 项
+
+
+六、常见问题
+------------
+- 首次运行被杀软拦截：--onefile 的 exe 常被误报，加白名单，或改用 --onedir。
+- 启动慢（2~5 秒）：--onefile 每次启动都要解包，属正常现象；--onedir 明显更快。
+- 双击没反应 / 一闪而过：去掉 --windowed 重新打包一次，从控制台看报错。
+- 提示找不到 configs.json：确认 json 与 exe 在同一目录（见第三节）。
+- 打包后点【打开配置目录】没反应：确认第三节的文件布局正确。
+- 版本号 / 作者信息：见 main.py 顶部的 APP_VERSION 与 show_about()。

@@ -30,7 +30,7 @@ from tkinter import messagebox, ttk
 import nic_driver
 from sftp_browser import SFTPBrowser
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = nic_driver.app_dir()  # 打包成 exe 后取 exe 所在目录，保证能读到可编辑的 json
 CONFIG_PATH = os.path.join(BASE_DIR, "configs.json")
 APP_VERSION = "2.0"
 
@@ -290,6 +290,8 @@ class App:
 
         buttons = ttk.Frame(self.root)
         buttons.pack(fill=tk.X, padx=12, pady=6)
+        self.adapt_btn = ttk.Button(buttons, text="一键适配此网卡", command=self.adapt_iface)
+        self.adapt_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.apply_btn = ttk.Button(buttons, text="应用配置", command=self.apply_config_clicked)
         self.apply_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.restart_btn = ttk.Button(buttons, text="重启网卡", command=self.restart_iface)
@@ -425,6 +427,37 @@ class App:
 
         self._start_job(_job)
 
+    def adapt_iface(self):
+        """
+        一键适配此网卡：探测 + 语义推断 + 自动记入本地档案（纯读取，不改动网卡任何设置）。
+        适配后直接点【应用配置】即可。
+        """
+        iface = self.selected_iface()
+        if not iface:
+            messagebox.showwarning("提示", "请先选择网口")
+            return
+        self.log.write("\n[一键适配] 正在识别网卡 %s 的驱动属性（不会改动网卡设置）……" % iface)
+
+        def _job():
+            result = nic_driver.adapt_adapter(iface, self.log)
+            if not result.get("ok"):
+                self.log.call(messagebox.showerror, "适配失败",
+                              "无法读取该网卡的高级属性:\n%s" % (result.get("error") or "未知错误"))
+                return
+            keywords = result.get("keywords") or {}
+            if keywords:
+                detail = "\n".join(
+                    "%s：%s" % (nic_driver.ROLE_LABEL.get(role, role), keyword)
+                    for role, keyword in keywords.items())
+                message = ("已自动识别并记入本地档案：\n\n%s\n\n"
+                           "现在可以直接点【应用配置】，以后插同一张网卡会自动命中。" % detail)
+            else:
+                message = ("未能识别出任何 MAC/VLAN 属性。\n"
+                           "请在【帮助 → 驱动适配说明】中导出探测文件反馈给开发者。")
+            self.log.call(messagebox.showinfo, "适配完成", message)
+
+        self._start_job(_job)
+
     def clear_log(self):
         try:
             self.output_text.delete("1.0", "end")
@@ -468,7 +501,7 @@ class App:
 
     def _set_controls(self, enabled):
         state = "normal" if enabled else "disabled"
-        for button in (self.apply_btn, self.restart_btn, self.sftp_btn):
+        for button in (self.adapt_btn, self.apply_btn, self.restart_btn, self.sftp_btn):
             try:
                 button.config(state=state)
             except Exception:
@@ -553,7 +586,9 @@ class App:
             "1. 选择网口（下拉框已过滤虚拟网卡，显示「接口名 — 驱动型号（状态）」）。\n"
             "2. 选择配置后点击【应用配置】——选中下拉框不会改动网卡。\n"
             "3. 应用配置会写入 IP / MAC / VLAN / ARP，MAC 与 VLAN 写入后会自动重启网卡。\n"
-            "4. 遇到新网卡先点【探测驱动属性】，导出 JSON 后按提示补充 driver_profiles.json。\n"
+            "4. 换新网卡时先点【一键适配此网卡】（纯读取，不改设置），识别结果会自动记住，\n"
+            "   然后直接点【应用配置】即可，无需手工编辑任何文件。\n"
+            "5. 遇到识别不出的网卡再点【探测驱动属性】导出 JSON 反馈给开发者。\n"
             "5. 【打开 SFTP 浏览器】会先检测连通性，再进入远程文件系统下载售后数据。\n\n"
             "常见问题：\n"
             "- 提示「该驱动未提供此属性」：该网卡确实不支持（如 Intel I219-V 无 VLAN ID）。\n"
