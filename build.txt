@@ -6,19 +6,28 @@
 1) 确认 Python 可用（3.9+，本机实测 3.14）：
        python --version
 2) 安装运行依赖与打包工具（在项目根目录执行，即本文件所在目录）：
-       pip install -r requirements.txt
-       pip install pyinstaller
+       python -m pip install -r requirements.txt
+       python -m pip install pyinstaller
+
+   注意：一律用 `python -m pip` 而不是裸 `pip`，避免出现
+   "pip 不是内部或外部命令"。装完后**不需要**去找 pyinstaller.exe 的路径，
+   下面统一用 `python -m PyInstaller` 调用（等价，且不受 PATH 影响）。
 
 
 二、构建（每次改完代码执行）
 ----------------------------
 在项目根目录执行（cmd 下用 ^ 续行；PowerShell 请改成一行或用 ` 续行）：
 
-    pyinstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+    python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
         --name ADMLC_EthTool ^
         --collect-submodules paramiko ^
         --collect-submodules cryptography ^
         main.py
+
+   若报错 "术语 'pyinstaller' 不会被识别为 cmdlet、函数、脚本文件或可执行程序的名称"，
+   说明 pyinstaller.exe 不在 PATH 里——用上面的 `python -m PyInstaller` 即可，无需配环境变量。
+   若你的 PATH 里确实有 pyinstaller.exe，把开头的 `python -m PyInstaller`
+   换成 `pyinstaller` 也行，其余参数完全一样。
 
 参数说明：
     --onefile      打成单个 exe
@@ -31,7 +40,7 @@
 
 更推荐内部批量分发的替代方案（启动快、杀软误报少）：
 
-    pyinstaller --noconfirm --clean --onedir --windowed --uac-admin ^
+    python -m PyInstaller --noconfirm --clean --onedir --windowed --uac-admin ^
         --name ADMLC_EthTool --collect-submodules paramiko main.py
 
 产物：dist\ADMLC_EthTool\ 整个文件夹（内含 exe）
@@ -56,7 +65,7 @@
 
 四、带图标（可选）
 ------------------
-    pyinstaller ... --icon app.ico main.py
+    python -m PyInstaller ... --icon app.ico main.py
 
 
 五、打包前自检（建议每次改完代码先跑）
