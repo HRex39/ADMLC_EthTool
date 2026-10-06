@@ -1,0 +1,33 @@
+{
+  "_说明": [
+    "网卡驱动适配档案：按【驱动型号 InterfaceDescription】指定各角色的 RegistryKeyword。",
+    "匹配方式：先整串匹配（忽略大小写、不区分中英文系统），失败则按正则子串匹配，取最长匹配。",
+    "优先级：本文件 > nic_driver.py 内置关键字表 > DisplayName 多语言兜底。",
+    "值为 null 表示该驱动确实没有这个属性（例如 Intel I219-V 无法单独设置 VLAN ID）。",
+    "遇到不认识的新网卡：先在界面点【探测驱动属性】导出 driver_probe_*.json，",
+    "把 resolved_roles / profile_suggestion 里的 RegistryKeyword 抄到下面即可，无需改代码。",
+    "下面 4 条均已在本机注册表实测核对（Ndi\\Params）。"
+  ],
+  "profiles": {
+    "ASIX USB to Gigabit Ethernet Family Adapter": {
+      "mac": "NetworkAddress",
+      "vlan_mode": "*PriorityVLANTag",
+      "vlan_id": "VLAN_ID"
+    },
+    "Realtek USB GbE Family Controller": {
+      "mac": "NetworkAddress",
+      "vlan_mode": "*PriorityVLANTag",
+      "vlan_id": "RegVlanID"
+    },
+    "USB2.0 Ethernet Adapter": {
+      "mac": "NetworkAddress",
+      "vlan_mode": "PriorityVLANTag",
+      "vlan_id": null
+    },
+    "Intel(R) Ethernet Connection (16) I219-V": {
+      "mac": "NetworkAddress",
+      "vlan_mode": "*PriorityVLANTag",
+      "vlan_id": null
+    }
+  }
+}

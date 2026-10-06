@@ -1,6 +1,6 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import paramiko, os, stat, threading, traceback, sys
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import paramiko, os, stat, threading, traceback, sys, socket
 
 class SFTPBrowser(tk.Toplevel):
     def __init__(self, master, host, user, password, port=22):
@@ -8,12 +8,32 @@ class SFTPBrowser(tk.Toplevel):
         self.title("SFTP 浏览器")
         self.geometry("900x600")
 
-        # 连接 SFTP
+        # paramiko.SFTPClient 不是线程安全的：所有 self.sftp.* 访问都在此锁内串行执行
+        self._sftp_lock = threading.RLock()
+        # 传输任务忙标志（下载/上传/删除整体操作互斥）
+        self._transfer_busy = False
+        # 正在异步加载子节点的树节点集合（避免同一节点重复加载）
+        self._loading_nodes = set()
+
+        # 连接 SFTP（带建连/握手超时，避免防火墙静默丢包时永久卡死）
+        sock = None
         try:
-            self.transport = paramiko.Transport((host, port))
+            sock = socket.create_connection((host, port), timeout=8)
+            self.transport = paramiko.Transport(sock)
+            self.transport.banner_timeout = 15
+            self.transport.auth_timeout = 15
             self.transport.connect(username=user, password=password)
             self.sftp = paramiko.SFTPClient.from_transport(self.transport)
         except Exception as e:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            try:
+                self.transport.close()
+            except Exception:
+                pass
             messagebox.showerror("错误", f"无法连接 SFTP: {e}")
             self.destroy()
             return
@@ -81,10 +101,35 @@ class SFTPBrowser(tk.Toplevel):
         """在主线程执行 UI 更新"""
         self.after(0, lambda: fn(*a, **kw))
 
-    def _is_dir(sftp, entry=None, remote_path=None):
+    def _sftp_op(self, method, *args, **kwargs):
         """
-        健壮判断远程路径是否为目录。
-        - sftp: paramiko.SFTPClient 实例
+        在 SFTP 锁内串行调用 self.sftp.<method>(...)。
+        paramiko.SFTPClient 不是线程安全的，所有远程访问都必须经过这里。
+        """
+        with self._sftp_lock:
+            return getattr(self.sftp, method)(*args, **kwargs)
+
+    def _check_idle(self):
+        """检查是否已有传输任务在运行；若有则提示并返回 False。"""
+        if self._transfer_busy:
+            messagebox.showwarning("提示", "已有传输任务正在进行中")
+            return False
+        return True
+
+    def _begin_transfer(self):
+        """占用传输任务槽；已有任务在运行时提示并返回 False。"""
+        if not self._check_idle():
+            return False
+        self._transfer_busy = True
+        return True
+
+    def _end_transfer(self):
+        """释放传输任务槽（可安全地在工作线程中直接调用）。"""
+        self._transfer_busy = False
+
+    def _is_dir(self, entry=None, remote_path=None):
+        """
+        健壮判断远程路径是否为目录（实例方法，通过 self.sftp 访问远程）。
         - entry: paramiko.SFTPAttributes，可选
         - remote_path: 完整远程路径
         返回 True 表示目录（包括软链接指向目录），否则 False。
@@ -96,7 +141,7 @@ class SFTPBrowser(tk.Toplevel):
                     return True
                 if stat.S_ISLNK(mode) and remote_path:
                     try:
-                        target_attr = sftp.stat(remote_path)
+                        target_attr = self._sftp_op("stat", remote_path)
                         return stat.S_ISDIR(target_attr.st_mode)
                     except Exception:
                         return False
@@ -110,12 +155,12 @@ class SFTPBrowser(tk.Toplevel):
         # 兜底：只有在 st_mode 不可靠时才尝试 chdir
         if remote_path:
             try:
-                sftp.chdir(remote_path)
-                sftp.chdir("..")
+                self._sftp_op("chdir", remote_path)
+                self._sftp_op("chdir", "..")
                 return True
             except Exception:
                 return False
-        return False    
+        return False
 
 
     # ---------------- 树状加载 ----------------
@@ -127,50 +172,76 @@ class SFTPBrowser(tk.Toplevel):
         # 如果只有一个占位子节点 "dummy"，则删除并加载真实子节点
         children = self.tree.get_children(node)
         if len(children) == 1 and self.tree.item(children[0], "text") == "dummy":
+            # 传输进行中时 SFTP 通道正在被占用，先提示，保留占位符以便之后重试
+            if not self._check_idle():
+                return
+            if node in self._loading_nodes:
+                return
             self.tree.delete(children[0])
-            # 异步加载，避免 UI 卡顿
+            self._loading_nodes.add(node)
+            # 异步加载，避免 UI 卡顿；工作线程只做网络 I/O，节点插入回主线程
             threading.Thread(target=self._populate_tree, args=(node, path), daemon=True).start()
 
     def _populate_tree(self, parent, remote_path):
         """
-        用于在树中填充 remote_path 的子项（目录优先）。
+        工作线程：读取 remote_path 的子项（目录优先），只做网络 I/O 与数据整理。
+        Treeview 的占位符删除在 on_open（主线程）完成，节点插入统一由 _insert_children
+        在主线程完成，避免在工作线程里操作 Tkinter。
         异常会被捕获并通过 UI 报错，但不会崩溃。
         """
         try:
-            entries = self.sftp.listdir_attr(remote_path)
+            entries = self._sftp_op("listdir_attr", remote_path)
             dirs, others = [], []
             for entry in entries:
                 child_path = self._join_path(remote_path, entry.filename)
                 # 先用统一函数判断是否目录
                 try:
                     if self._is_dir(entry, child_path):
-                        dirs.append((entry, child_path))
+                        dirs.append((entry.filename, child_path))
                     else:
-                        others.append((entry, child_path))
+                        others.append((entry.filename, child_path, getattr(entry, "st_mode", 0) or 0))
                 except Exception:
                     # 任何异常都当作文件处理，避免中断
-                    others.append((entry, child_path))
+                    others.append((entry.filename, child_path, getattr(entry, "st_mode", 0) or 0))
 
-            # 先插入目录（按名字排序）
-            for entry, child_path in sorted(dirs, key=lambda x: x[0].filename):
-                node = self.tree.insert(parent, "end", text=f"📁 {entry.filename}", values=(child_path,))
-                # 占位符，展开时再加载
-                self.tree.insert(node, "end", text="dummy")
+            # 先整理目录（按名字排序）
+            dir_items = [(name, child_path) for name, child_path in sorted(dirs, key=lambda x: x[0])]
 
-            # 再插入文件或链接（按名字排序）
-            for entry, child_path in sorted(others, key=lambda x: x[0].filename):
-                mode = getattr(entry, "st_mode", 0) or 0
+            # 再整理文件或链接（按名字排序）
+            file_items = []
+            for name, child_path, mode in sorted(others, key=lambda x: x[0]):
                 try:
                     if stat.S_ISLNK(mode):
-                        display = f"🔗 {entry.filename}"
+                        display = f"🔗 {name}"
                     else:
-                        display = f"📄 {entry.filename}"
+                        display = f"📄 {name}"
                 except Exception:
-                    display = f"📄 {entry.filename}"
-                self.tree.insert(parent, "end", text=display, values=(child_path,))
+                    display = f"📄 {name}"
+                file_items.append((display, child_path))
+
+            # 回到主线程插入节点
+            self._safe_ui(self._insert_children, parent, dir_items, file_items)
         except Exception as e:
             # 使用主线程弹窗
-            self._safe_ui(messagebox.showerror, "错误", f"无法列出 {remote_path}: {e}")
+            self._safe_ui(self._populate_failed, parent, remote_path, e)
+
+    def _insert_children(self, parent, dir_items, file_items):
+        """在主线程中插入子节点（先目录、后文件），占位符逻辑与 on_open 的判定保持一致。"""
+        self._loading_nodes.discard(parent)
+        if not self.tree.exists(parent):
+            # 父节点已被删除或刷新，丢弃本次结果
+            return
+        for name, child_path in dir_items:
+            node = self.tree.insert(parent, "end", text=f"📁 {name}", values=(child_path,))
+            # 占位符，展开时再加载
+            self.tree.insert(node, "end", text="dummy")
+        for display, child_path in file_items:
+            self.tree.insert(parent, "end", text=display, values=(child_path,))
+
+    def _populate_failed(self, parent, remote_path, err):
+        """在主线程报告列出目录失败，并允许该节点之后重新加载。"""
+        self._loading_nodes.discard(parent)
+        messagebox.showerror("错误", f"无法列出 {remote_path}: {err}")
 
 
     # ---------------- 双击与右键 ----------------
@@ -182,9 +253,12 @@ class SFTPBrowser(tk.Toplevel):
         node = self.tree.focus()
         if not node:
             return
+        # 传输进行中时 SFTP 通道被占用，避免并发访问与界面阻塞
+        if not self._check_idle():
+            return
         remote_path = self.tree.item(node, "values")[0]
         try:
-            attr = self.sftp.lstat(remote_path)
+            attr = self._sftp_op("lstat", remote_path)
             # 如果 lstat 表示目录（或链接指向目录），当作目录处理
             if stat.S_ISDIR(attr.st_mode):
                 is_open = self.tree.item(node, "open")
@@ -196,7 +270,7 @@ class SFTPBrowser(tk.Toplevel):
             if stat.S_ISLNK(attr.st_mode):
                 # 跟随链接判断目标
                 try:
-                    target = self.sftp.stat(remote_path)
+                    target = self._sftp_op("stat", remote_path)
                     if stat.S_ISDIR(target.st_mode):
                         is_open = self.tree.item(node, "open")
                         self.tree.item(node, open=not is_open)
@@ -258,45 +332,65 @@ class SFTPBrowser(tk.Toplevel):
             self.tree.item(root, open=True)
             self.refresh_current()
 
-    def _find_node_by_path(self, path):
-        # 遍历树查找值为 path 的节点（简单 DFS）
-        def dfs(node):
-            if self.tree.item(node, "values")[0] == path:
-                return node
-            for c in self.tree.get_children(node):
-                found = dfs(c)
-                if found:
-                    return found
-            return None
-        for root in self.tree.get_children(""):
-            found = dfs(root)
-            if found:
-                return found
-        return None
-
     # ---------------- 下载 ----------------
     def download_file(self):
         node = self.tree.focus()
         if not node:
             return
+        # 已有传输任务时直接提示返回，避免并发使用同一个 SFTP 通道
+        if not self._check_idle():
+            return
         remote_path = self.tree.item(node, "values")[0]
         filename = os.path.basename(remote_path)
         save_path = filedialog.asksaveasfilename(initialfile=filename)
-        if save_path:
+        if not save_path:
+            return
+        if not self._begin_transfer():
+            return
+        # 后台线程下载，界面不冻结
+        threading.Thread(target=self._download_file_worker,
+                         args=(remote_path, save_path, filename), daemon=True).start()
+
+    def _download_file_worker(self, remote_path, save_path, filename):
+        """后台线程下载单个文件，并用 paramiko 的字节回调刷新进度窗口。"""
+        try:
             try:
-                self.sftp.get(remote_path, save_path)
-                messagebox.showinfo("完成", f"已下载 {filename}")
-            except Exception as e:
-                messagebox.showerror("错误", f"下载失败: {e}")
+                size = self._sftp_op("stat", remote_path).st_size or 0
+            except Exception:
+                size = 0
+            self._safe_ui(self._start_progress, max(size, 1), f"正在下载 {filename}")
+            self._safe_ui(self._update_byte_progress, 0, size, filename)
+
+            pushed = [0]
+
+            def _on_progress(transferred, total_bytes):
+                # 限制刷新频率，避免大量 after 回调堆积
+                total = total_bytes or size or 0
+                if transferred - pushed[0] >= 262144 or (total and transferred >= total):
+                    pushed[0] = transferred
+                    self._safe_ui(self._update_byte_progress, transferred, total, filename)
+
+            self._sftp_op("get", remote_path, save_path, callback=_on_progress)
+            self._safe_ui(self._update_byte_progress, size or 0, size, filename)
+            self._safe_ui(self._end_progress)
+            self._safe_ui(messagebox.showinfo, "完成", f"已下载 {filename}")
+        except Exception as e:
+            self._safe_ui(self._end_progress)
+            self._safe_ui(messagebox.showerror, "错误", f"下载失败: {e}")
+        finally:
+            self._end_transfer()
 
     def download_folder(self):
         node = self.tree.focus()
         if not node:
             return
+        # 已有传输任务时直接提示返回
+        if not self._check_idle():
+            return
         remote_path = self.tree.item(node, "values")[0]
         # 确认是目录
         try:
-            attr = self.sftp.lstat(remote_path)
+            attr = self._sftp_op("lstat", remote_path)
             if not stat.S_ISDIR(attr.st_mode) and not stat.S_ISLNK(attr.st_mode):
                 messagebox.showinfo("提示", f"{remote_path} 不是目录或软链接，无法下载文件夹")
                 return
@@ -310,18 +404,20 @@ class SFTPBrowser(tk.Toplevel):
         foldername = os.path.basename(remote_path.rstrip("/"))
         local_dir = os.path.join(local_parent, foldername)
 
-        # 计算总文件数（用于进度）
-        total_files = self._count_files(remote_path)
+        # 不再预先遍历统计文件数（避免二次遍历大目录），进度上限在工作线程中动态增长
+        if not self._begin_transfer():
+            return
         # 启动线程下载
-        threading.Thread(target=self._download_worker, args=(remote_path, local_dir, total_files), daemon=True).start()
+        threading.Thread(target=self._download_worker, args=(remote_path, local_dir), daemon=True).start()
 
-    def _download_worker(self, remote_path, local_dir, total_files):
+    def _download_worker(self, remote_path, local_dir):
         errors = []
         try:
-            self._safe_ui(self._start_progress, total_files, f"下载 {remote_path}")
+            self._safe_ui(self._start_progress, 1, f"下载 {remote_path}")
             self._download_dir(remote_path, local_dir, errors)
         finally:
             self._safe_ui(self._end_progress)
+            self._end_transfer()
             if errors:
                 msg = "\n".join([f"{p}: {err}" for p, err in errors])
                 self._safe_ui(messagebox.showerror, "部分文件下载失败", msg)
@@ -331,7 +427,7 @@ class SFTPBrowser(tk.Toplevel):
     def _count_files(self, remote_dir):
         count = 0
         try:
-            for entry in self.sftp.listdir_attr(remote_dir):
+            for entry in self._sftp_op("listdir_attr", remote_dir):
                 remote_item = self._join_path(remote_dir, entry.filename)
                 if self._is_dir(entry, remote_item):
                     count += self._count_files(remote_item)
@@ -343,7 +439,7 @@ class SFTPBrowser(tk.Toplevel):
 
     def _download_dir(self, remote_dir, local_dir, errors=None):
         os.makedirs(local_dir, exist_ok=True)
-        for entry in self.sftp.listdir_attr(remote_dir):
+        for entry in self._sftp_op("listdir_attr", remote_dir):
             remote_path = self._join_path(remote_dir, entry.filename)
             local_path = os.path.join(local_dir, entry.filename)
             try:
@@ -352,17 +448,17 @@ class SFTPBrowser(tk.Toplevel):
                 elif stat.S_ISLNK(entry.st_mode):
                     # 软链接，跟随目标
                     try:
-                        target_attr = self.sftp.stat(remote_path)
+                        target_attr = self._sftp_op("stat", remote_path)
                         if stat.S_ISDIR(target_attr.st_mode):
                             self._download_dir(remote_path, local_path, errors)
                         else:
-                            self.sftp.get(remote_path, local_path)
+                            self._sftp_op("get", remote_path, local_path)
                     except Exception as e:
                         if errors is not None:
                             errors.append((remote_path, f"软链接下载失败: {e}"))
                 else:
                     try:
-                        self.sftp.get(remote_path, local_path)
+                        self._sftp_op("get", remote_path, local_path)
                     except Exception as e:
                         if errors is not None:
                             errors.append((remote_path, str(e)))
@@ -375,6 +471,9 @@ class SFTPBrowser(tk.Toplevel):
 
     # ---------------- 上传 ----------------
     def upload_file(self):
+        # 已有传输任务时直接提示返回
+        if not self._check_idle():
+            return
         filepath = filedialog.askopenfilename()
         if not filepath:
             return
@@ -383,7 +482,7 @@ class SFTPBrowser(tk.Toplevel):
         if node:
             remote_dir = self.tree.item(node, "values")[0]
             try:
-                attr = self.sftp.lstat(remote_dir)
+                attr = self._sftp_op("lstat", remote_dir)
                 if not stat.S_ISDIR(attr.st_mode):
                     remote_dir = os.path.dirname(remote_dir) or "/"
             except Exception:
@@ -391,12 +490,14 @@ class SFTPBrowser(tk.Toplevel):
         else:
             remote_dir = "/"
         remote_path = self._join_path(remote_dir, os.path.basename(filepath))
+        if not self._begin_transfer():
+            return
         threading.Thread(target=self._upload_worker_single, args=(filepath, remote_path), daemon=True).start()
 
     def _upload_worker_single(self, local_path, remote_path):
         try:
             self._safe_ui(self._start_progress, 1, f"上传: {os.path.basename(local_path)}")
-            self.sftp.put(local_path, remote_path)
+            self._sftp_op("put", local_path, remote_path)
             self._safe_ui(self._step_progress, os.path.basename(local_path))
             self._safe_ui(self._end_progress)
             self._safe_ui(messagebox.showinfo, "完成", f"已上传 {os.path.basename(local_path)}")
@@ -404,9 +505,15 @@ class SFTPBrowser(tk.Toplevel):
             parent_remote = os.path.dirname(remote_path) or "/"
             self._safe_ui(self._refresh_remote_node_by_path, parent_remote)
         except Exception as e:
+            self._safe_ui(self._end_progress)
             self._safe_ui(messagebox.showerror, "错误", f"上传失败: {e}\n{traceback.format_exc()}")
+        finally:
+            self._end_transfer()
 
     def upload_folder(self):
+        # 已有传输任务时直接提示返回
+        if not self._check_idle():
+            return
         folderpath = filedialog.askdirectory()
         if not folderpath:
             return
@@ -415,7 +522,7 @@ class SFTPBrowser(tk.Toplevel):
         if node:
             remote_dir = self.tree.item(node, "values")[0]
             try:
-                attr = self.sftp.lstat(remote_dir)
+                attr = self._sftp_op("lstat", remote_dir)
                 if not stat.S_ISDIR(attr.st_mode):
                     remote_dir = os.path.dirname(remote_dir) or "/"
             except Exception:
@@ -426,6 +533,8 @@ class SFTPBrowser(tk.Toplevel):
         target_remote = self._join_path(remote_dir, foldername)
         # 计算本地文件数
         total = self._count_local_files(folderpath)
+        if not self._begin_transfer():
+            return
         threading.Thread(target=self._upload_worker_dir, args=(folderpath, target_remote, total), daemon=True).start()
 
     def upload_folder_to_selected_dir(self):
@@ -453,15 +562,18 @@ class SFTPBrowser(tk.Toplevel):
             parent_remote = os.path.dirname(remote_target) or "/"
             self._safe_ui(self._refresh_remote_node_by_path, parent_remote)
         except Exception as e:
+            self._safe_ui(self._end_progress)
             self._safe_ui(messagebox.showerror, "错误", f"上传失败: {e}\n{traceback.format_exc()}")
+        finally:
+            self._end_transfer()
 
     def _upload_dir(self, local_dir, remote_dir):
         # 确保远程目录存在
         try:
-            self.sftp.listdir(remote_dir)
+            self._sftp_op("listdir", remote_dir)
         except IOError:
             try:
-                self.sftp.mkdir(remote_dir)
+                self._sftp_op("mkdir", remote_dir)
             except Exception:
                 pass
         for item in sorted(os.listdir(local_dir)):
@@ -470,7 +582,7 @@ class SFTPBrowser(tk.Toplevel):
             if os.path.isdir(local_path):
                 self._upload_dir(local_path, remote_path)
             else:
-                self.sftp.put(local_path, remote_path)
+                self._sftp_op("put", local_path, remote_path)
                 self._safe_ui(self._step_progress, item)
 
     # ---------------- 删除 ----------------
@@ -478,33 +590,40 @@ class SFTPBrowser(tk.Toplevel):
         node = self.tree.focus()
         if not node:
             return
+        # 已有传输任务时直接提示返回
+        if not self._check_idle():
+            return
         remote_path = self.tree.item(node, "values")[0]
         if not messagebox.askyesno("确认删除", f"确定要删除远程：{remote_path} 吗？"):
+            return
+        if not self._begin_transfer():
             return
         threading.Thread(target=self._delete_worker, args=(node, remote_path), daemon=True).start()
 
     def _delete_worker(self, node, remote_path):
         try:
             self._safe_ui(self._set_status, f"删除 {remote_path} ...")
-            attr = self.sftp.lstat(remote_path)
+            attr = self._sftp_op("lstat", remote_path)
             if stat.S_ISDIR(attr.st_mode):
                 self._delete_dir(remote_path)
             else:
-                self.sftp.remove(remote_path)
+                self._sftp_op("remove", remote_path)
             self._safe_ui(lambda: self.tree.delete(node))
             self._safe_ui(self._set_status, "删除完成")
         except Exception as e:
             self._safe_ui(messagebox.showerror, "错误", f"删除失败: {e}\n{traceback.format_exc()}")
             self._safe_ui(self._set_status, "删除失败")
+        finally:
+            self._end_transfer()
 
     def _delete_dir(self, remote_dir):
-        for entry in self.sftp.listdir_attr(remote_dir):
+        for entry in self._sftp_op("listdir_attr", remote_dir):
             remote_item = self._join_path(remote_dir, entry.filename)
             if self._is_dir(entry, remote_item):
                 self._delete_dir(remote_item)
             else:
-                self.sftp.remove(remote_item)
-        self.sftp.rmdir(remote_dir)
+                self._sftp_op("remove", remote_item)
+        self._sftp_op("rmdir", remote_dir)
 
     # ---------------- 进度 UI ----------------
     def _start_progress(self, total, title="进行中"):
@@ -517,7 +636,8 @@ class SFTPBrowser(tk.Toplevel):
         self.progress_count = 0
         self.progress_win = tk.Toplevel(self)
         self.progress_win.title(title)
-        self.progress = ttk.Progressbar(self.progress_win, length=400, mode="determinate", maximum=total)
+        # total 可能为 0（总数未知），maximum 至少为 1，避免进度条异常
+        self.progress = ttk.Progressbar(self.progress_win, length=400, mode="determinate", maximum=max(total, 1))
         self.progress.pack(padx=20, pady=10)
         self.progress_label = tk.Label(self.progress_win, text="准备...")
         self.progress_label.pack(padx=20, pady=6)
@@ -526,9 +646,35 @@ class SFTPBrowser(tk.Toplevel):
     def _step_progress(self, current_name):
         self.progress_count += 1
         if self.progress:
+            # 总数未知（如未预先统计）时动态调大上限
+            if self.progress_count > self.progress_total:
+                self.progress_total = self.progress_count
+                self.progress.config(maximum=self.progress_total)
             self.progress['value'] = self.progress_count
         if self.progress_label:
             self.progress_label.config(text=f"{current_name}  ({self.progress_count}/{self.progress_total})")
+
+    def _update_byte_progress(self, transferred, total, name):
+        """
+        按字节更新进度（主线程调用，用于单文件下载）。
+        total 为 0 时表示文件大小未知，只显示文件名。
+        """
+        if total:
+            total = max(total, 1)
+            self.progress_total = total
+            if self.progress:
+                try:
+                    if float(self.progress.cget("maximum")) != float(total):
+                        self.progress.config(maximum=total)
+                except Exception:
+                    pass
+                self.progress['value'] = min(transferred, total)
+            if self.progress_label:
+                self.progress_label.config(text=f"正在下载 {name}  {transferred}/{total} 字节")
+        else:
+            self.progress_total = 0
+            if self.progress_label:
+                self.progress_label.config(text=f"正在下载 {name}")
 
     def _end_progress(self):
         if self.progress_win:
@@ -593,14 +739,20 @@ class SFTPBrowser(tk.Toplevel):
         # 远程目标列表（按需可改）
         targets = ["/log", "/backlog", "/alglog"]
 
+        # 已有传输任务时直接提示返回
+        if not self._check_idle():
+            return
+
         # 让用户选择本地父目录
         local_parent = filedialog.askdirectory(title="选择保存售后数据的本地目录")
         if not local_parent:
             return
 
-        # 计算总文件数（可能耗时，放到线程里）
+        if not self._begin_transfer():
+            return
+        # 统计与下载都在工作线程中进行（不再预先遍历整棵树）
         threading.Thread(target=self._download_aftersales_worker, args=(targets, local_parent), daemon=True).start()
-    
+
     def download_calib(self):
         """
         一键下载 /f120calib, /params 两个远程文件夹到本地选择的父目录。
@@ -609,30 +761,25 @@ class SFTPBrowser(tk.Toplevel):
         # 远程目标列表（按需可改）
         targets = ["/f120calib", "/params"]
 
+        # 已有传输任务时直接提示返回
+        if not self._check_idle():
+            return
+
         # 让用户选择本地父目录
         local_parent = filedialog.askdirectory(title="选择保存标定数据的本地目录")
         if not local_parent:
             return
 
-        # 计算总文件数（可能耗时，放到线程里）
+        if not self._begin_transfer():
+            return
+        # 统计与下载都在工作线程中进行（不再预先遍历整棵树）
         threading.Thread(target=self._download_aftersales_worker, args=(targets, local_parent), daemon=True).start()
 
     def _download_aftersales_worker(self, targets, local_parent):
         try:
-            # 统计总文件数（对每个目标调用已有的 _count_files）
-            total = 0
-            for t in targets:
-                try:
-                    total += self._count_files(t)
-                except Exception:
-                    # 若统计失败，继续但不计入（保守处理）
-                    pass
-            if total <= 0:
-                # 如果统计不到文件数，至少把进度设为 1，避免除零或无进度条
-                total = 1
-
-            # 启动统一进度窗口（在主线程）
-            self._safe_ui(self._start_progress, total, "下载售后问题数据")
+            # 先弹出进度窗口（不确定总数），不再预先 _count_files 二次遍历大目录；
+            # 每个文件完成后由 _step_progress 递增并把 maximum 动态调大。
+            self._safe_ui(self._start_progress, 1, "下载售后问题数据")
 
             # 逐个下载
             for remote_dir in targets:
@@ -642,14 +789,14 @@ class SFTPBrowser(tk.Toplevel):
                 try:
                     # 如果远程不是目录则跳过并记录
                     try:
-                        attr = self.sftp.lstat(remote_dir)
+                        attr = self._sftp_op("lstat", remote_dir)
                         if not stat.S_ISDIR(attr.st_mode):
                             # 不是目录，跳过
                             continue
                     except Exception:
                         # 无法判断，尝试列目录以确认
                         try:
-                            _ = self.sftp.listdir(remote_dir)
+                            _ = self._sftp_op("listdir", remote_dir)
                         except Exception:
                             continue
 
@@ -665,6 +812,8 @@ class SFTPBrowser(tk.Toplevel):
         except Exception as e:
             self._safe_ui(self._end_progress)
             self._safe_ui(messagebox.showerror, "错误", f"一键下载失败: {e}\n{traceback.format_exc()}")
+        finally:
+            self._end_transfer()
 
 
 # ----------------- 如果你想单独运行测试 -----------------
