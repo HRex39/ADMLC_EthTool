@@ -162,6 +162,34 @@ def _to_int(value):
         return None
 
 
+# ----------------------------------------------------------------------------
+# MTU 校验（仅“帮助 → 高级设置”入口使用，不写进 configs.json）
+# ----------------------------------------------------------------------------
+
+MTU_MIN = 1280   # IPv6 规定的最小链路 MTU；再低在现网没有实际意义
+MTU_MAX = 1500   # 标准以太网帧；更大的值属于巨帧，需要交换机/网卡同时支持
+
+
+def parse_mtu(value, minimum=MTU_MIN, maximum=MTU_MAX):
+    """
+    校验并归一化 MTU 输入。
+
+    返回 (mtu, error)：成功时 error 为 None；失败时 mtu 为 None，error 是可直接
+    展示给用户的中文原因。只接受 ASCII 数字，避免全角数字、千分位、小数点混入。
+    """
+    if value is None:
+        return None, "MTU 不能为空"
+    text = str(value).strip()
+    if not text:
+        return None, "MTU 不能为空"
+    if not re.fullmatch(r"[0-9]+", text):
+        return None, "MTU 必须是整数（例如 1400）"
+    mtu = int(text)
+    if not minimum <= mtu <= maximum:
+        return None, "MTU 必须在 %d~%d 之间" % (minimum, maximum)
+    return mtu, None
+
+
 def run_ps(script, timeout=_PS_TIMEOUT):
     """
     执行 PowerShell 脚本，返回 (returncode, stdout, stderr)。

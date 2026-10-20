@@ -124,6 +124,18 @@ check("normalize_mac 非法(短)", nd.normalize_mac("0A0B0C"), None)
 check("mac_warning 合法 LAA", nd.mac_warning("0a0b0c026969"), None)
 check("mac_warning 组播地址被警告", nd.mac_warning("010b0c026969") is not None, True)
 
+# ---- MTU 校验（只允许 1280~1500，边界必须精确） ----
+check("parse_mtu 1400", nd.parse_mtu("1400"), (1400, None))
+check("parse_mtu 去首尾空格", nd.parse_mtu(" 1280 "), (1280, None))
+check("parse_mtu 下限 1280", nd.parse_mtu(1280), (1280, None))
+check("parse_mtu 下限越界 1279", nd.parse_mtu(1279)[0], None)
+check("parse_mtu 上限 1500", nd.parse_mtu(1500), (1500, None))
+check("parse_mtu 上限越界 1501", nd.parse_mtu(1501)[0], None)
+check("parse_mtu 拒绝小数", nd.parse_mtu("1400.0")[0], None)
+check("parse_mtu 拒绝非数字", nd.parse_mtu("14O0")[0], None)
+check("parse_mtu 拒绝空值", nd.parse_mtu("")[0], None)
+check("parse_mtu 拒绝全角数字", nd.parse_mtu("１４００")[0], None)
+
 # ---- 掩码转换 ----
 import windows_config as wc  # noqa: E402
 

@@ -32,7 +32,20 @@ from sftp_browser import SFTPBrowser
 
 BASE_DIR = nic_driver.app_dir()  # 打包成 exe 后取 exe 所在目录，保证能读到可编辑的 json
 CONFIG_PATH = os.path.join(BASE_DIR, "configs.json")
-APP_VERSION = "2.0"
+
+
+def _build_stamp():
+    """构建时间：源码运行时取 main.py 的修改时间，打包后取 exe 的生成时间。"""
+    try:
+        target = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(target)))
+    except Exception:
+        return "未知"
+
+
+APP_VERSION = "2.2"
+APP_BUILD = _build_stamp()
+APP_VERSION_FULL = "%s (%s)" % (APP_VERSION, APP_BUILD)
 
 STATUS_CN = {
     "Up": "已连接",
@@ -240,7 +253,7 @@ class App:
         self._busy = False
         self._lock = threading.Lock()
 
-        root.title("网口配置工具 & 售后数据下载器  v%s" % APP_VERSION)
+        root.title("网口配置工具 & 售后数据下载器  v%s" % APP_VERSION_FULL)
         root.geometry("760x680")
         root.minsize(680, 560)
 
@@ -256,11 +269,18 @@ class App:
         help_menu.add_command(label="驱动适配说明", command=self.show_driver_help)
         help_menu.add_separator()
         help_menu.add_command(label="打开配置目录", command=self.open_config_dir)
+        help_menu.add_command(label="高级设置…", command=self.open_advanced_settings,
+                              accelerator="Ctrl+Alt+M")
         help_menu.add_separator()
         help_menu.add_command(label="关于", command=self.show_about)
         menubar.add_cascade(label="帮助", menu=help_menu)
         try:
             self.root.config(menu=menubar)
+        except Exception:
+            pass
+        # 高级设置只挂在菜单里，不占主界面按钮；Ctrl+Alt+M 方便自己快速打开
+        try:
+            self.root.bind_all("<Control-Alt-KeyPress-m>", self._advanced_shortcut)
         except Exception:
             pass
 
@@ -317,10 +337,10 @@ class App:
                   relief="sunken").pack(fill=tk.X, side=tk.BOTTOM)
         author = ttk.Frame(self.root)
         author.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 2))
-        ttk.Label(author, text="作者: Chenrui Huang    版本: %s" % APP_VERSION,
+        ttk.Label(author, text="作者: Chenrui Huang    版本: %s" % APP_VERSION_FULL,
                   anchor="w").pack(side=tk.LEFT)
 
-        self.log.write("网口配置工具 v%s 已启动（管理员权限正常）" % APP_VERSION)
+        self.log.write("网口配置工具 v%s 已启动（管理员权限正常）" % APP_VERSION_FULL)
         self.log.write("提示：选择网口与配置后，点击【应用配置】才会真正修改网卡。")
         self.log.write("首次使用新网卡时，可先点【探测驱动属性】查看识别结果。\n")
 
@@ -473,6 +493,38 @@ class App:
         except Exception as exc:
             messagebox.showerror("错误", "无法打开目录: %s" % exc)
 
+    # ---------- 高级设置（MTU） ----------
+    def _advanced_shortcut(self, _event=None):
+        self.open_advanced_settings()
+        return "break"
+
+    def open_advanced_settings(self):
+        """
+        帮助 → 高级设置：修改所选网口的 MTU。
+
+        MTU 只在这里改：主界面不加按钮、configs.json 不读该字段、帮助正文也不提，
+        避免不懂的用户误改。
+        """
+        existing = getattr(self, "_mtu_dialog", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            pass
+        if self._busy:
+            messagebox.showinfo("请稍候", "已有任务正在执行，请等待完成。")
+            return
+        iface = self.selected_iface()
+        if not iface:
+            messagebox.showwarning("提示", "请先在主界面选择网口")
+            return
+        if platform_config is None or not hasattr(platform_config, "set_mtu"):
+            messagebox.showinfo("提示", "当前系统不支持修改 MTU")
+            return
+        self._mtu_dialog = AdvancedMtuDialog(self)
+
     # ---------- 任务调度 ----------
     def _start_job(self, func, *args):
         """在后台线程执行任务，期间禁用按钮；完成后由日志泵回调恢复。"""
@@ -618,13 +670,209 @@ class App:
         text = (
             "网口配置工具 & 售后数据下载器\n"
             "版本: %s\n"
+            "构建时间: %s\n"
             "作者: Chenrui Huang\n"
             "邮箱: hcr2077@outlook.com\n\n"
             "说明: 按注册表关键字适配各厂商网卡驱动，用于网口配置与远程售后数据下载。"
-            % APP_VERSION
+            % (APP_VERSION, APP_BUILD)
         )
         self.log.write("\n[关于]\n" + text)
         messagebox.showinfo("关于", text)
+
+
+class AdvancedMtuDialog(tk.Toplevel):
+    """
+    帮助 → 高级设置：修改所选网口的 IPv4 MTU。
+
+    MTU 只允许从这里改（configs.json 不支持该字段），范围由
+    nic_driver.MTU_MIN / MTU_MAX 限定；写完后端会回读校验。
+    """
+
+    def __init__(self, app):
+        tk.Toplevel.__init__(self, app.root)
+        self.app = app
+        self.iface = app.selected_iface()
+        self.current_mtu = None
+        self._applying = False
+        self._applied = False
+
+        self.title("高级设置 · 网卡 MTU")
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _event: self._close())
+
+        self.mtu_var = tk.StringVar()
+        self.current_var = tk.StringVar(value="读取中…")
+        self._build()
+        self._read_current()
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+    # ---------- 界面 ----------
+    def _build(self):
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text="网口:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(body, text=self.iface).grid(row=0, column=1, columnspan=3,
+                                              sticky="w", pady=2)
+
+        ttk.Label(body, text="当前 MTU:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(body, textvariable=self.current_var).grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=2)
+
+        ttk.Label(body, text="MTU:").grid(row=2, column=0, sticky="w", pady=(10, 2))
+        self.entry = ttk.Entry(
+            body, textvariable=self.mtu_var, width=10, validate="key",
+            validatecommand=(self.register(self._validate_key), "%P"))
+        self.entry.grid(row=2, column=1, sticky="w", pady=(10, 2))
+        ttk.Label(body, text="范围 %d–%d" % (nic_driver.MTU_MIN, nic_driver.MTU_MAX)
+                  ).grid(row=2, column=2, columnspan=2, sticky="w", padx=8)
+
+        preset = ttk.Frame(body)
+        preset.grid(row=3, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(preset, text="常用:").pack(side=tk.LEFT)
+        for value in (1500, 1450, 1400, 1280):
+            ttk.Button(preset, text=str(value), width=6,
+                       command=lambda v=value: self.mtu_var.set(str(v))
+                       ).pack(side=tk.LEFT, padx=2)
+
+        self.hint = ttk.Label(body, text="", foreground="#666666")
+        self.hint.grid(row=4, column=0, columnspan=4, sticky="w")
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        self.apply_btn = ttk.Button(buttons, text="应用", command=self._apply)
+        self.apply_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="关闭", command=self._close).pack(side=tk.LEFT)
+
+        self.mtu_var.trace_add("write", self._refresh_hint)
+        self.entry.bind("<Return>", lambda _event: self._apply())
+        self._refresh_hint()
+
+    @staticmethod
+    def _validate_key(proposed):
+        """输入时只放行 0~4 位 ASCII 数字；真正的范围校验在 _apply 里做。"""
+        if proposed == "":
+            return True
+        return proposed.isascii() and proposed.isdigit() and len(proposed) <= 4
+
+    def _refresh_hint(self, *_args):
+        text = self.mtu_var.get().strip()
+        if not text:
+            self.hint.config(text="请输入 %d–%d 的整数，例如 1400"
+                                  % (nic_driver.MTU_MIN, nic_driver.MTU_MAX),
+                             foreground="#666666")
+            return
+        value, error = nic_driver.parse_mtu(text)
+        if value is None:
+            self.hint.config(text="⚠ " + error, foreground="#b00020")
+        else:
+            self.hint.config(text="✓ %d 在允许范围内" % value, foreground="#1a7f37")
+
+    # ---------- 读取当前值 ----------
+    def _read_current(self):
+        def _worker():
+            value = None
+            try:
+                if hasattr(platform_config, "get_mtu"):
+                    value = platform_config.get_mtu(self.iface)
+            except Exception:
+                value = None
+            try:
+                self.app.log.call(self._on_current_read, value)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_current_read(self, value):
+        try:
+            if not self.winfo_exists() or self._applied:
+                return
+            self.current_mtu = value
+            self.current_var.set("%d" % value if value is not None else "读取失败")
+            if value is not None and not self.mtu_var.get().strip():
+                self.mtu_var.set(str(value))
+        except Exception:
+            pass
+
+    # ---------- 应用 ----------
+    def _apply(self):
+        if self._applying:
+            return
+        value, error = nic_driver.parse_mtu(self.mtu_var.get())
+        if value is None:
+            self.bell()
+            self.hint.config(text="⚠ " + error, foreground="#b00020")
+            return
+        if self.current_mtu is not None and value == self.current_mtu:
+            messagebox.showinfo("无需修改", "MTU 已经是 %d。" % value, parent=self)
+            return
+        if not messagebox.askyesno(
+                "确认修改",
+                "将网口【%s】的 MTU 从 %s 改为 %d？\n\n"
+                "修改立即生效；已建立的连接需要重连。"
+                % (self.iface,
+                   "-" if self.current_mtu is None else self.current_mtu, value),
+                parent=self):
+            return
+
+        self._applying = True
+        self.apply_btn.config(state="disabled")
+        self.entry.config(state="disabled")
+
+        def _worker():
+            ok = False
+            try:
+                ok = platform_config.set_mtu(self.iface, value, self.app.log)
+            except Exception:
+                self.app.log.write("❌ 设置 MTU 异常:\n%s" % traceback.format_exc())
+            try:
+                self.app.log.call(self._on_applied, ok, value)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_applied(self, ok, value):
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        self._applying = False
+        self.entry.config(state="normal")
+        self.apply_btn.config(state="normal")
+        if ok:
+            self._applied = True
+            self.current_mtu = value
+            self.current_var.set(str(value))
+            messagebox.showinfo(
+                "完成",
+                "网口【%s】的 MTU 已改为 %d。\n\n"
+                "已建立的 SFTP 连接仍使用旧 MSS，请断开后重新连接。"
+                % (self.iface, value), parent=self)
+        else:
+            messagebox.showerror("失败", "MTU 修改失败，详情见主窗口日志。", parent=self)
+
+    def _close(self):
+        if self._applying:
+            self.bell()
+            return
+        self._applying = False
+        try:
+            self.app._mtu_dialog = None
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
 
 
 def main():

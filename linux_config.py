@@ -3,9 +3,10 @@
 # 与 Windows 版保持一致的接口：apply_config_windows / apply_config_linux(iface, cfg, log_target)
 # 第三个参数既可以是 log(msg) 可调用对象，也可以直接传 Tk Text 控件（兼容旧调用）。
 
+import re
 import subprocess
 
-from nic_driver import as_log, normalize_mac
+from nic_driver import as_log, normalize_mac, parse_mtu
 
 
 def _run(cmd, timeout=20):
@@ -115,3 +116,46 @@ def apply_config_linux(iface, cfg, log_target):
             log("ℹ️ 已尝试设置 MAC 为 %s（需重启网口生效）" % mac_colon)
 
     log("✅ 已完成 %s 的配置" % target)
+
+
+# ----------------------------------------------------------------------------
+# MTU（与 Windows 版同名接口，供“帮助 → 高级设置”调用）
+# ----------------------------------------------------------------------------
+
+def get_mtu(iface):
+    """读取网口当前 MTU；读不到返回 None。"""
+    if not iface:
+        return None
+    rc, out, err = _run(["ip", "-o", "link", "show", "dev", iface])
+    if rc != 0:
+        return None
+    match = re.search(r"\bmtu\s+(\d+)", out)
+    return int(match.group(1)) if match else None
+
+
+def set_mtu(iface, mtu, log_target):
+    """设置网口 MTU 并回读校验。返回 True/False。"""
+    log = as_log(log_target)
+    value, error = parse_mtu(mtu)
+    if value is None:
+        log("⚠️ 设置 MTU 失败: %s" % error)
+        return False
+    if not iface:
+        log("⚠️ 设置 MTU 失败: 未指定网口")
+        return False
+
+    old = get_mtu(iface)
+    if old == value:
+        log("ℹ️ 网口 %s 的 MTU 已经是 %d，无需修改" % (iface, value))
+        return True
+
+    if not _run_logged(["ip", "link", "set", "dev", iface, "mtu", str(value)],
+                       log, on_error="设置 MTU 失败"):
+        return False
+    readback = get_mtu(iface)
+    if readback != value:
+        log("⚠️ MTU 回读不一致（期望 %d，实际 %s）"
+            % (value, "-" if readback is None else readback))
+        return False
+    log("✅ MTU 已设置为 %d（已建立的连接需重连才会使用新 MSS）" % value)
+    return True

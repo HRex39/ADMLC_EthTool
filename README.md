@@ -108,8 +108,8 @@ selftest_config_flow.py  离线自检：配置编排流程（monkeypatch 掉系�
 ## 自检
 
 ```bash
-python selftest_nic_driver.py     # 解析逻辑：53 项
-python selftest_config_flow.py    # 编排流程：23 项
+python selftest_nic_driver.py     # 解析逻辑：63 项
+python selftest_config_flow.py    # 编排流程：30 项
 ```
 
 两个脚本都不依赖真实网卡、不改动系统，改完代码跑一遍即可回归。覆盖：

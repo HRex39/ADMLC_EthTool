@@ -207,6 +207,104 @@ def restart_adapter(iface, log_target=None, wait_seconds=25):
 
 
 # ----------------------------------------------------------------------------
+# MTU（IP 层 MTU：影响 TCP MSS，是解决 SFTP 黑洞的开关）
+# ----------------------------------------------------------------------------
+
+def _mtu_from_netsh(iface_name):
+    """从 netsh 输出里解析指定网口的 IPv4 MTU（非管理员也可读，作为兜底）。"""
+    rc, out, err = run(["netsh", "interface", "ipv4", "show", "subinterfaces"])
+    if rc != 0:
+        return None
+    target = str(iface_name).strip().lower()
+    for line in out.splitlines():
+        match = re.match(r"^\s*(\d+)\s+\d+\s+\d+\s+\d+\s+(.+?)\s*$", line)
+        if match and match.group(2).strip().lower() == target:
+            return int(match.group(1))
+    return None
+
+
+def get_mtu(iface):
+    """读取网口当前 IPv4 MTU；读不到返回 None。"""
+    if not iface:
+        return None
+    script = r"""
+$name = __NAME__
+try {
+    $rows = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction Stop)
+    if ($rows.Count -eq 0) { throw '未找到该网口的 IPv4 接口' }
+    @{ ok = $true; mtu = [int]$rows[0].NlMtu } | ConvertTo-Json -Compress
+} catch {
+    @{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+}
+""".replace("__NAME__", nic_driver._ps_str(iface))
+    data = nic_driver.run_ps_json(script, timeout=30)
+    if data.get("ok") and data.get("mtu") is not None:
+        try:
+            return int(data["mtu"])
+        except (TypeError, ValueError):
+            pass
+    return _mtu_from_netsh(iface)
+
+
+def set_mtu(iface, mtu, log_target):
+    """
+    设置网口 IPv4 MTU 并持久化（重启后仍生效）。
+
+    优先 Set-NetIPInterface，失败退回 netsh store=persistent；写完必须回读，
+    回读一致才返回 True。不重启网卡：IP MTU 立即生效，重启只会白白断链路。
+    """
+    log = as_log(log_target)
+    if not iface:
+        log("⚠️ 设置 MTU 失败: 未指定网口")
+        return False
+    value, error = nic_driver.parse_mtu(mtu)
+    if value is None:
+        log("⚠️ 设置 MTU 失败: %s" % error)
+        return False
+
+    old = get_mtu(iface)
+    if old == value:
+        log("ℹ️ 网口 %s 的 MTU 已经是 %d，无需修改" % (iface, value))
+        return True
+
+    log("⏳ 正在把网口 %s 的 MTU 从 %s 改为 %d……"
+        % (iface, "-" if old is None else old, value))
+
+    script = r"""
+$name = __NAME__
+$mtu = __MTU__
+try {
+    Set-NetIPInterface -InterfaceAlias $name -AddressFamily IPv4 -NlMtuBytes $mtu -ErrorAction Stop
+    $rows = @(Get-NetIPInterface -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction Stop)
+    @{ ok = $true; mtu = [int]$rows[0].NlMtu } | ConvertTo-Json -Compress
+} catch {
+    @{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+}
+""".replace("__NAME__", nic_driver._ps_str(iface)).replace("__MTU__", str(value))
+    data = nic_driver.run_ps_json(script, timeout=60)
+    applied = bool(data.get("ok")) and data.get("mtu") == value
+
+    if not applied:
+        # 某些驱动/策略禁止 Set-NetIPInterface，退回 netsh（同样持久化）
+        rc, out, err = run(["netsh", "interface", "ipv4", "set", "subinterface",
+                            iface, "mtu=%d" % value, "store=persistent"])
+        if rc != 0:
+            log("⚠️ 设置 MTU 失败: %s"
+                % (data.get("error") or err or out or "未知错误"))
+            return False
+
+    readback = get_mtu(iface)
+    if readback != value:
+        log("⚠️ MTU 回读不一致（期望 %d，实际 %s），驱动或策略可能拒绝了该值"
+            % (value, "-" if readback is None else readback))
+        return False
+
+    log("✅ MTU 已设置为 %d（回读一致，store=persistent，重启后仍生效）" % value)
+    log("   ℹ️ 已建立的 SFTP 连接仍使用旧 MSS，请断开后重新连接。")
+    return True
+
+
+# ----------------------------------------------------------------------------
 # 内部：日志与结果汇总
 # ----------------------------------------------------------------------------
 

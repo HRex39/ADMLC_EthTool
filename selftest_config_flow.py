@@ -193,6 +193,44 @@ check("DEFAULT: 已切 DHCP", any("source=dhcp" in x for x in lines6))
 check("DEFAULT: 已清空 ARP", any("清空 ARP 表" in x for x in lines6))
 check("DEFAULT: 已重启网卡", any("[stub] 重启网卡" in x for x in lines6))
 
+# ================= MTU：范围校验 / PowerShell 下发 / netsh 兜底 / 回读 =================
+mtu_lines = []
+
+
+def stub_mtu(ps_result, readback_seq, run_result=(0, "", "")):
+    """替换 MTU 相关的所有系统调用，返回 netsh/PS 调用记录。"""
+    calls = []
+    nd.run_ps_json = lambda script, timeout=60: ps_result
+    wc.run = lambda cmd, timeout=None: (calls.append(cmd) or run_result)
+    seq = list(readback_seq)
+
+    def fake_get_mtu(iface):
+        return seq.pop(0) if seq else None
+
+    wc.get_mtu = fake_get_mtu
+    return calls
+
+
+calls = stub_mtu({"ok": True, "mtu": 1400}, [1500, 1400])
+check("MTU: 合法值 1400 下发成功", wc.set_mtu("以太网 13", 1400, mtu_lines.append), True)
+check("MTU: 成功路径不触发 netsh 兜底", not calls, str(calls))
+
+stub_mtu({"ok": True, "mtu": 1400}, [])
+eq("MTU: 越界 9000 直接拒绝", wc.set_mtu("以太网 13", 9000, mtu_lines.append), False)
+
+calls = stub_mtu({"ok": False, "error": "拒绝访问"}, [1500, 1400])
+check("MTU: PowerShell 失败时 netsh 兜底成功",
+      wc.set_mtu("以太网 13", 1400, mtu_lines.append), True)
+check("MTU: 兜底命令带 store=persistent",
+      any(isinstance(cmd, (list, tuple)) and "store=persistent" in cmd
+          for cmd in calls), True)
+
+stub_mtu({"ok": True, "mtu": 1400}, [1500, 1500])
+eq("MTU: 回读不一致判失败", wc.set_mtu("以太网 13", 1400, mtu_lines.append), False)
+
+stub_mtu({"ok": True, "mtu": 1400}, [1400])
+check("MTU: 已是目标值时跳过", wc.set_mtu("以太网 13", 1400, mtu_lines.append), True)
+
 print("\n结果:", "全部通过" if not FAIL else "失败项 -> %s" % FAIL)
 sys.exit(1 if FAIL else 0)
 
