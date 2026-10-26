@@ -8,7 +8,7 @@
     "mac": "auto",
     "arp": "auto"
   },
-  "ADMLC_DebugTool": {
+  "ADMLC_DebugTool_8155": {
     "mode": "test",
     "ip": "172.16.105.105",
     "netmask": "255.255.255.0",
@@ -17,6 +17,35 @@
     "mac": "0A0B0C026969",
     "arp": [
       {"ip": "172.16.105.26", "mac": "0A-0B-0C-02-00-06"}
+    ]
+  },
+  "ADMLC_DebugTool_8255": {
+    "mode": "default",
+    "ip": "auto",
+    "netmask": "auto",
+    "gateway": "auto",
+    "vlan_id": "auto",
+    "mac": "auto",
+    "arp": "auto",
+    "access": [
+      {
+        "host": "169.254.1.0",
+        "port": 22,
+        "user": "root",
+        "password": "Patac458Vsm",
+        "wait_link_local": true,
+        "wait_link_local_timeout": 45,
+        "retry_seconds": 20,
+        "need_config": "ADMLC_DebugTool_8255"
+      },
+      {
+        "host": "172.16.4.26",
+        "port": 22,
+        "user": "root",
+        "password": "bY6dCcBBZ0HsM3m",
+        "via": "jump",
+        "retry_seconds": 60
+      }
     ]
   }
 }

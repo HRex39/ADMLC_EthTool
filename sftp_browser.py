@@ -3,7 +3,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import paramiko, os, stat, threading, traceback, sys, socket
 
 class SFTPBrowser(tk.Toplevel):
-    def __init__(self, master, host, user, password, port=22):
+    def __init__(self, master, host, user, password, port=22, sftp_client=None):
         super().__init__(master)
         self.title("SFTP 浏览器")
         self.geometry("900x600")
@@ -16,27 +16,32 @@ class SFTPBrowser(tk.Toplevel):
         self._loading_nodes = set()
 
         # 连接 SFTP（带建连/握手超时，避免防火墙静默丢包时永久卡死）
-        sock = None
-        try:
-            sock = socket.create_connection((host, port), timeout=8)
-            self.transport = paramiko.Transport(sock)
-            self.transport.banner_timeout = 15
-            self.transport.auth_timeout = 15
-            self.transport.connect(username=user, password=password)
-            self.sftp = paramiko.SFTPClient.from_transport(self.transport)
-        except Exception as e:
-            if sock is not None:
+        # 传入 sftp_client 时（8255 的 SSH 跳板链路）直接复用外部已建好的连接，不再自建。
+        if sftp_client is not None:
+            self.sftp = sftp_client
+            self.transport = None
+        else:
+            sock = None
+            try:
+                sock = socket.create_connection((host, port), timeout=8)
+                self.transport = paramiko.Transport(sock)
+                self.transport.banner_timeout = 15
+                self.transport.auth_timeout = 15
+                self.transport.connect(username=user, password=password)
+                self.sftp = paramiko.SFTPClient.from_transport(self.transport)
+            except Exception as e:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
                 try:
-                    sock.close()
+                    self.transport.close()
                 except Exception:
                     pass
-            try:
-                self.transport.close()
-            except Exception:
-                pass
-            messagebox.showerror("错误", f"无法连接 SFTP: {e}")
-            self.destroy()
-            return
+                messagebox.showerror("错误", f"无法连接 SFTP: {e}")
+                self.destroy()
+                return
 
         # 当前路径（保留原逻辑）
         self.start_dir = "/"

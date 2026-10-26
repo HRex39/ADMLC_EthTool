@@ -231,6 +231,64 @@ eq("MTU: 回读不一致判失败", wc.set_mtu("以太网 13", 1400, mtu_lines.a
 stub_mtu({"ok": True, "mtu": 1400}, [1400])
 check("MTU: 已是目标值时跳过", wc.set_mtu("以太网 13", 1400, mtu_lines.append), True)
 
+# ================= 配置结构：三套配置与 8255 的两跳链路 =================
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
+
+with open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "configs.json"),
+          "r", encoding="utf-8") as _fh:
+    cfgs = _json.load(_fh)
+
+check("配置：存在 Auto", "Auto" in cfgs)
+check("配置：存在 ADMLC_DebugTool_8155", "ADMLC_DebugTool_8155" in cfgs)
+check("配置：旧名 ADMLC_DebugTool 已移除", "ADMLC_DebugTool" not in cfgs)
+eq("配置：8155 网卡参数保持原样",
+   (cfgs["ADMLC_DebugTool_8155"]["ip"],
+    cfgs["ADMLC_DebugTool_8155"]["netmask"],
+    cfgs["ADMLC_DebugTool_8155"]["vlan_id"],
+    cfgs["ADMLC_DebugTool_8155"]["mac"]),
+   ("172.16.105.105", "255.255.255.0", 105, "0A0B0C026969"))
+eq("配置：8155 的静态 ARP 未变",
+   cfgs["ADMLC_DebugTool_8155"]["arp"],
+   [{"ip": "172.16.105.26", "mac": "0A-0B-0C-02-00-06"}])
+check("配置：8155 不带多跳链路（走原有直连）",
+      "access" not in cfgs["ADMLC_DebugTool_8155"])
+eq("配置：8255 网卡基线 = Auto(default)", cfgs["ADMLC_DebugTool_8255"]["mode"], "default")
+
+hops_8255 = cfgs["ADMLC_DebugTool_8255"]["access"]
+eq("配置：8255 是两跳", len(hops_8255), 2)
+eq("配置：8255 第一跳 = 网关", hops_8255[0]["host"], "169.254.1.0")
+eq("配置：8255 第二跳 = 目标", hops_8255[1]["host"], "172.16.4.26")
+eq("配置：8255 第二跳走跳板", hops_8255[1].get("via"), "jump")
+check("配置：8255 第一跳要求先拿到链路本地地址",
+      hops_8255[0].get("wait_link_local") is True)
+eq("配置：8255 第一跳端口 22", hops_8255[0]["port"], 22)
+eq("配置：8255 第二跳端口 22", hops_8255[1]["port"], 22)
+
+import device_access as da  # noqa: E402
+
+eq("hops_from_config: 8255 解析出 2 跳",
+   len(da.hops_from_config(cfgs["ADMLC_DebugTool_8255"])), 2)
+eq("hops_from_config: 8155 返回空（不改变原行为）",
+   da.hops_from_config(cfgs["ADMLC_DebugTool_8155"]), [])
+eq("hops_from_config: 脏数据被过滤",
+   da.hops_from_config({"access": [None, {"host": ""}, {"host": "1.2.3.4"}]}),
+   [{"host": "1.2.3.4"}])
+eq("hops_from_config: 无 access 返回空", da.hops_from_config({}), [])
+
+# 等待 169.254.x.x：用桩函数验证三条分支（不打真实网络）
+_orig_local_ipv4 = da.local_ipv4
+da.local_ipv4 = lambda iface: ["192.168.1.5"]
+eq("等链路本地：非 APIPA 时超时返回 False",
+   da.wait_link_local("X", timeout=0.2, interval=0.05), False)
+da.local_ipv4 = lambda iface: ["169.254.7.8"]
+eq("等链路本地：命中时返回地址",
+   da.wait_link_local("X", timeout=1, interval=0.05), "169.254.7.8")
+da.local_ipv4 = lambda iface: None
+eq("等链路本地：读不到地址返回 None（继续尝试）",
+   da.wait_link_local("X", timeout=0.1, interval=0.05), None)
+da.local_ipv4 = _orig_local_ipv4
+
 print("\n结果:", "全部通过" if not FAIL else "失败项 -> %s" % FAIL)
 sys.exit(1 if FAIL else 0)
 

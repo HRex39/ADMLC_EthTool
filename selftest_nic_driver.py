@@ -37,8 +37,9 @@ check("无显示名信息时启用 -> 取 3",
       nd.choose_vlan_mode_value({"ValidDisplayValues": None, "ValidRegistryValues": [0, 1, 2, 3]}, True)[0], 3)
 
 # ---- 三级匹配：ASIX（档案命中） ----
-profiles = nd.load_profiles()
-check("driver_profiles.json 条目数", len(profiles), 4)
+# 只测随程序分发的档案，避免受本机 driver_profiles.local.json（运行时自动学习）影响
+profiles = nd.load_profiles(path=nd.PROFILE_FILE)
+check("随程序分发的 driver_profiles.json 条目数", len(profiles), 4)
 
 insp = nd.AdapterInspector("以太网 13", profiles=profiles, discover=False)
 insp.ok = True

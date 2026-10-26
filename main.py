@@ -27,6 +27,7 @@ import traceback
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import device_access
 import nic_driver
 from sftp_browser import SFTPBrowser
 
@@ -43,7 +44,7 @@ def _build_stamp():
         return "未知"
 
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 APP_BUILD = _build_stamp()
 APP_VERSION_FULL = "%s (%s)" % (APP_VERSION, APP_BUILD)
 
@@ -581,8 +582,71 @@ class App:
         except Exception:
             return False
 
+    def _open_jump_sftp(self, hops):
+        """
+        多跳配置（8255）：按 access 序列建立 SSH 跳板链路，再打开 SFTP 浏览器。
+        PC 地址保持 169.254.x.x 不变，第二跳经网关的 SSH 通道转发。
+        """
+        iface = self.selected_iface()
+        title = "连接检测（多跳）"
+        check_win = tk.Toplevel(self.root)
+        check_win.title(title)
+        check_win.geometry("430x130")
+        check_win.resizable(False, False)
+        ttk.Label(check_win, text="链路：%s" % " → ".join(
+            str(hop.get("host")) for hop in hops)).pack(padx=12, pady=(10, 4))
+        progress_label = ttk.Label(check_win, text="准备中…", wraplength=400, justify="left")
+        progress_label.pack(padx=12, pady=6)
+        check_win.protocol("WM_DELETE_WINDOW", lambda: None)
+        check_win.transient(self.root)
+        check_win.grab_set()
+
+        def _progress(text):
+            self.log.call(progress_label.config, text=text)
+
+        def _worker():
+            try:
+                transports, sftp = device_access.connect_chain(
+                    hops, iface=iface, log=self.log, on_progress=_progress)
+            except Exception as exc:
+                self.log.write("❌ 多跳连接失败: %s" % exc)
+
+                def _fail():
+                    try:
+                        check_win.destroy()
+                    except Exception:
+                        pass
+                    messagebox.showerror("连接失败", str(exc))
+
+                self.log.call(_fail)
+                return
+
+            def _open():
+                try:
+                    check_win.destroy()
+                except Exception:
+                    pass
+                self.log.write("\n✅ 多跳链路已建立：%s"
+                               % " → ".join(str(hop.get("host")) for hop in hops))
+                try:
+                    device_access.open_browser(self.root, hops, transports, sftp)
+                except Exception as exc:
+                    device_access.close_all(transports)
+                    messagebox.showerror("错误", "打开 SFTP 窗口失败: %s" % exc)
+
+            self.log.call(_open)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def open_sftp_window(self):
         """先检测可达性，再打开 SFTP 浏览器。"""
+        # 选中的配置带多跳链路（如 8255）时走跳板流程；其余配置（含 Auto / 8155）行为不变。
+        cfg = self.configs.get(self.config_var.get()) or {}
+        hops = device_access.hops_from_config(cfg)
+        if len(hops) >= 2:
+            self._open_jump_sftp(hops)
+            return
+
         host, user, password, port = "172.16.105.26", "root", "bY6dCcBBZ0HsM3m", 22
 
         check_win = tk.Toplevel(self.root)
